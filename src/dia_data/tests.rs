@@ -27,6 +27,8 @@ fn create_mock_alpha_raw_view<'a>(
         peak_mz: ArrayView1::from(peak_mz),
         peak_intensity: ArrayView1::from(peak_intensity),
         cycle: ArrayView4::from_shape([1, 1, 1, 1], cycle).unwrap(),
+        peak_scan_idx: None,
+        num_scans: 1,
     }
 }
 

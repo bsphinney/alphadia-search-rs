@@ -25,6 +25,8 @@ fn create_mock_alpha_raw_view<'a>(
         peak_mz: ArrayView1::from(peak_mz),
         peak_intensity: ArrayView1::from(peak_intensity),
         cycle: ArrayView4::from_shape([1, 1, 1, 1], cycle).unwrap(),
+        peak_scan_idx: None,
+        num_scans: 1,
     }
 }
 
@@ -266,4 +268,68 @@ fn test_cycle_ordering_preservation() {
     assert_eq!(intensities[0], 2000.0); // Intensity from cycle 0
     assert_eq!(intensities[1], 3000.0); // Intensity from cycle 1
     assert_eq!(intensities[2], 1000.0); // Intensity from cycle 2
+}
+
+#[test]
+fn test_im_builder_mobility_windowed_extraction() {
+    use crate::dia_data::AlphaRawView;
+    use numpy::ndarray::{Array1, ArrayView1, ArrayView4};
+
+    // One quad window (delta_scan_idx 0), one fragment m/z present at two IM
+    // scans (2 and 9) across two cycles (0 and 1). num_scans = 16.
+    let spectrum_delta_scan_idx = [0i64, 0, 0, 0];
+    let isolation_lower_mz = [400.0f32, 400.0, 400.0, 400.0];
+    let isolation_upper_mz = [600.0f32, 600.0, 600.0, 600.0];
+    let spectrum_peak_start_idx = [0i64, 1, 2, 3];
+    let spectrum_peak_stop_idx = [1i64, 2, 3, 4];
+    let spectrum_cycle_idx = [0i64, 1, 0, 1];
+    let spectrum_rt = [1.0f32, 2.0, 1.0, 2.0];
+    let mz_target = MZIndex::global().mz[1000];
+    let peak_mz = [mz_target, mz_target, mz_target, mz_target];
+    let peak_intensity = [10.0f32, 20.0, 5.0, 7.0];
+    // scan 2 for the first two events, scan 9 for the last two
+    let peak_scan_idx = [2i64, 2, 9, 9];
+    let cycle_data = [0.0f32];
+
+    let view = AlphaRawView::new_im(
+        ArrayView1::from(&spectrum_delta_scan_idx),
+        ArrayView1::from(&isolation_lower_mz),
+        ArrayView1::from(&isolation_upper_mz),
+        ArrayView1::from(&spectrum_peak_start_idx),
+        ArrayView1::from(&spectrum_peak_stop_idx),
+        ArrayView1::from(&spectrum_cycle_idx),
+        ArrayView1::from(&spectrum_rt),
+        ArrayView1::from(&peak_mz),
+        ArrayView1::from(&peak_intensity),
+        ArrayView4::from_shape([1, 1, 1, 1], &cycle_data).unwrap(),
+        ArrayView1::from(&peak_scan_idx),
+        16,
+    );
+
+    let dia_data = DIADataBuilder::from_alpha_raw(&view);
+    assert!(dia_data.has_mobility);
+    assert_eq!(dia_data.num_scans, 16);
+
+    let obs = &dia_data.quadrupole_observations[0];
+    assert!(obs.has_mobility());
+
+    // Full mobility range [0,16): cycle0 = 10+5 = 15 ; cycle1 = 20+7 = 27
+    let mut xic_full = Array1::<f32>::zeros(2);
+    obs.fill_xic_slice_mobility_windowed(
+        MZIndex::global(),
+        &mut xic_full.view_mut(),
+        0, 2, 0, 16, 20.0, mz_target,
+    );
+    assert!((xic_full[0] - 15.0).abs() < 1e-3, "full c0 {}", xic_full[0]);
+    assert!((xic_full[1] - 27.0).abs() < 1e-3, "full c1 {}", xic_full[1]);
+
+    // Mobility window [2,3): only scan-2 events survive -> cycle0=10, cycle1=20
+    let mut xic_win = Array1::<f32>::zeros(2);
+    obs.fill_xic_slice_mobility_windowed(
+        MZIndex::global(),
+        &mut xic_win.view_mut(),
+        0, 2, 2, 3, 20.0, mz_target,
+    );
+    assert!((xic_win[0] - 10.0).abs() < 1e-3, "win c0 {}", xic_win[0]);
+    assert!((xic_win[1] - 20.0).abs() < 1e-3, "win c1 {}", xic_win[1]);
 }

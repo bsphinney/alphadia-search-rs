@@ -26,6 +26,8 @@ fn create_simple_alpha_raw() -> AlphaRawView<'static> {
         peak_mz: ArrayView1::from(&PEAK_MZ),
         peak_intensity: ArrayView1::from(&PEAK_INTENSITY),
         cycle: ArrayView4::from_shape([1, 1, 1, 1], &CYCLE_DATA).unwrap(),
+        peak_scan_idx: None,
+        num_scans: 1,
     }
 }
 
@@ -167,6 +169,8 @@ fn test_dense_xic_mz_weighted_average() {
         peak_mz: ArrayView1::from(&PEAK_MZ),
         peak_intensity: ArrayView1::from(&PEAK_INTENSITY),
         cycle: ArrayView4::from_shape([1, 1, 1, 1], &CYCLE_DATA).unwrap(),
+        peak_scan_idx: None,
+        num_scans: 1,
     };
 
     let dia_data = DIADataBuilder::from_alpha_raw(&alpha_raw);
@@ -208,6 +212,8 @@ fn test_dense_xic_mz_zero_intensity_handling() {
         peak_mz: ArrayView1::from(&PEAK_MZ),
         peak_intensity: ArrayView1::from(&PEAK_INTENSITY),
         cycle: ArrayView4::from_shape([1, 1, 1, 1], &CYCLE_DATA).unwrap(),
+        peak_scan_idx: None,
+        num_scans: 1,
     };
 
     let dia_data = DIADataBuilder::from_alpha_raw(&alpha_raw);

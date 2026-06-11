@@ -12,12 +12,18 @@ pub use alpha_raw_view::AlphaRawView;
 ///
 /// This structure achieves >99.9% memory overhead reduction compared to the original
 /// by using consolidated arrays instead of millions of individual allocations.
+///
+/// Ion-mobility (timsTOF / dia-PASEF): when built from IM data, `has_mobility` is
+/// true and `num_scans > 1`; each `QuadrupoleObservation` then carries per-event
+/// scan indices enabling mobility-windowed and 3D extraction.
 #[pyclass]
 pub struct DIAData {
     pub rt_index: RTIndex,
     pub quadrupole_observations: Vec<QuadrupoleObservation>,
     pub rt_values: Array1<f32>,
     pub cycle: Array4<f32>,
+    pub num_scans: usize,
+    pub has_mobility: bool,
 }
 
 impl Default for DIAData {
@@ -35,6 +41,8 @@ impl DIAData {
             quadrupole_observations: Vec::new(),
             rt_values: Array1::zeros((0,)),
             cycle: Array4::zeros((0, 0, 0, 0)),
+            num_scans: 1,
+            has_mobility: false,
         }
     }
 
@@ -67,6 +75,47 @@ impl DIAData {
         );
 
         // Use optimized builder
+        let dia_data = DIADataBuilder::from_alpha_raw(&alpha_raw_view);
+        Ok(dia_data)
+    }
+
+    /// IM-aware constructor for timsTOF / dia-PASEF.
+    ///
+    /// Identical to `from_arrays` plus a per-peak `peak_scan_idx` (ion-mobility
+    /// scan index, parallel to `peak_mz`/`peak_intensity`) and `num_scans`
+    /// (total number of mobility scans per frame).
+    #[staticmethod]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_arrays_im<'py>(
+        spectrum_delta_scan_idx: PyReadonlyArray1<'py, i64>,
+        isolation_lower_mz: PyReadonlyArray1<'py, f32>,
+        isolation_upper_mz: PyReadonlyArray1<'py, f32>,
+        spectrum_peak_start_idx: PyReadonlyArray1<'py, i64>,
+        spectrum_peak_stop_idx: PyReadonlyArray1<'py, i64>,
+        spectrum_cycle_idx: PyReadonlyArray1<'py, i64>,
+        spectrum_rt: PyReadonlyArray1<'py, f32>,
+        peak_mz: PyReadonlyArray1<'py, f32>,
+        peak_intensity: PyReadonlyArray1<'py, f32>,
+        cycle: PyReadonlyArray4<'py, f32>,
+        peak_scan_idx: PyReadonlyArray1<'py, i64>,
+        num_scans: usize,
+        _py: Python<'py>,
+    ) -> PyResult<Self> {
+        let alpha_raw_view = AlphaRawView::new_im(
+            spectrum_delta_scan_idx.as_array(),
+            isolation_lower_mz.as_array(),
+            isolation_upper_mz.as_array(),
+            spectrum_peak_start_idx.as_array(),
+            spectrum_peak_stop_idx.as_array(),
+            spectrum_cycle_idx.as_array(),
+            spectrum_rt.as_array(),
+            peak_mz.as_array(),
+            peak_intensity.as_array(),
+            cycle.as_array(),
+            peak_scan_idx.as_array(),
+            num_scans,
+        );
+
         let dia_data = DIADataBuilder::from_alpha_raw(&alpha_raw_view);
         Ok(dia_data)
     }
@@ -111,7 +160,7 @@ impl DIAData {
 
     #[getter]
     pub fn has_mobility(&self) -> bool {
-        false
+        self.has_mobility
     }
 
     #[getter]
@@ -120,8 +169,21 @@ impl DIAData {
     }
 
     #[getter]
+    pub fn num_scans(&self) -> usize {
+        self.num_scans
+    }
+
+    #[getter]
     pub fn mobility_values(&self) -> Vec<f32> {
-        vec![1e-6, 0.0]
+        // Kept for API compatibility. The Rust extraction works in scan-index
+        // space; absolute 1/K0 mobility values live on the Python side and are
+        // not required by the scorer. Return a 2-element placeholder for the
+        // non-IM case (historical behavior) or a length-num_scans ramp for IM.
+        if self.has_mobility {
+            (0..self.num_scans).map(|s| s as f32).collect()
+        } else {
+            vec![1e-6, 0.0]
+        }
     }
 
     #[getter]
@@ -157,6 +219,14 @@ impl crate::traits::DIADataTrait for DIAData {
 
     fn memory_footprint_bytes(&self) -> usize {
         self.memory_footprint_bytes()
+    }
+
+    fn has_mobility(&self) -> bool {
+        self.has_mobility
+    }
+
+    fn num_scans(&self) -> usize {
+        self.num_scans
     }
 }
 

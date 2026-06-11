@@ -21,6 +21,17 @@ pub trait DIADataTrait {
     fn memory_footprint_mb(&self) -> f64 {
         self.memory_footprint_bytes() as f64 / (1024.0 * 1024.0)
     }
+
+    /// Whether this data carries an ion-mobility dimension (timsTOF / dia-PASEF).
+    /// Defaults to false for mobility-agnostic backends.
+    fn has_mobility(&self) -> bool {
+        false
+    }
+
+    /// Number of ion-mobility scans (1 when no mobility dimension).
+    fn num_scans(&self) -> usize {
+        1
+    }
 }
 
 /// Trait for quadrupole observation types that support XIC slice filling

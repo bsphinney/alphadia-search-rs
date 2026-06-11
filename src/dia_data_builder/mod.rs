@@ -19,6 +19,8 @@ impl DIADataBuilder {
             quadrupole_observations,
             rt_values: alpha_raw_view.spectrum_rt.to_owned(),
             cycle: alpha_raw_view.cycle.to_owned(),
+            num_scans: alpha_raw_view.num_scans,
+            has_mobility: alpha_raw_view.has_mobility(),
         }
     }
 
@@ -54,6 +56,7 @@ impl DIADataBuilder {
         target_delta_scan_idx: i64,
     ) -> QuadrupoleObservation {
         let mz_index = MZIndex::global();
+        let has_mobility = alpha_raw_view.has_mobility();
         // 2.1: Get all spectra with this delta_scan_idx and build list with spectra_idx
         let matching_spectra: Vec<usize> = alpha_raw_view
             .spectrum_delta_scan_idx
@@ -70,8 +73,17 @@ impl DIADataBuilder {
 
         if matching_spectra.is_empty() {
             // Return empty observation for missing delta_scan_idx
-            let mut empty_obs =
-                QuadrupoleObservation::new_with_capacity([0.0, 0.0], 0, mz_index.len(), 0);
+            let mut empty_obs = if has_mobility {
+                QuadrupoleObservation::new_with_capacity_im(
+                    [0.0, 0.0],
+                    0,
+                    alpha_raw_view.num_scans,
+                    mz_index.len(),
+                    0,
+                )
+            } else {
+                QuadrupoleObservation::new_with_capacity([0.0, 0.0], 0, mz_index.len(), 0)
+            };
             // Finalize all slices to ensure slice_starts has correct length
             for _ in 0..mz_index.len() {
                 empty_obs.finalize_slice();
@@ -90,8 +102,9 @@ impl DIADataBuilder {
             .collect();
         let num_cycles = unique_cycles.len();
 
-        // 2.2: Sort peaks and accumulate QuadrupoleObservationNextGen in parallel
-        let mut all_peaks: Vec<(usize, u16, f32)> = Vec::new();
+        // 2.2: Sort peaks and accumulate. For IM data we carry a scan index too.
+        // tuple = (mz_idx, cycle_idx, scan_idx, intensity)
+        let mut all_peaks: Vec<(usize, u16, u16, f32)> = Vec::new();
 
         // Collect all peaks from matching spectra
         for &spectrum_idx in &matching_spectra {
@@ -103,22 +116,36 @@ impl DIADataBuilder {
                 let mz = alpha_raw_view.peak_mz[peak_idx];
                 let intensity = alpha_raw_view.peak_intensity[peak_idx];
                 let mz_idx = mz_index.find_closest_index(mz);
-
-                all_peaks.push((mz_idx, cycle_idx, intensity));
+                let scan_idx = match &alpha_raw_view.peak_scan_idx {
+                    Some(scan_arr) => scan_arr[peak_idx] as u16,
+                    None => 0u16,
+                };
+                all_peaks.push((mz_idx, cycle_idx, scan_idx, intensity));
             }
         }
 
         // Sort peaks by (mz_idx, cycle_idx) to preserve temporal order within each mz_idx
-        // This is critical for binary search correctness in fill_xic_slice
-        all_peaks.sort_by_key(|(mz_idx, cycle_idx, _)| (*mz_idx, *cycle_idx));
+        // This is critical for binary search correctness in fill_xic_slice.
+        // (scan_idx is a tie-breaker and does not affect the cycle-sorted invariant.)
+        all_peaks.sort_by_key(|(mz_idx, cycle_idx, scan_idx, _)| (*mz_idx, *cycle_idx, *scan_idx));
 
         // Build observation with sorted peaks
-        let mut obs = QuadrupoleObservation::new_with_capacity(
-            [isolation_lower, isolation_upper],
-            num_cycles,
-            mz_index.len(),
-            all_peaks.len(),
-        );
+        let mut obs = if has_mobility {
+            QuadrupoleObservation::new_with_capacity_im(
+                [isolation_lower, isolation_upper],
+                num_cycles,
+                alpha_raw_view.num_scans,
+                mz_index.len(),
+                all_peaks.len(),
+            )
+        } else {
+            QuadrupoleObservation::new_with_capacity(
+                [isolation_lower, isolation_upper],
+                num_cycles,
+                mz_index.len(),
+                all_peaks.len(),
+            )
+        };
 
         let mut current_mz_idx = 0;
         let mut peak_idx = 0;
@@ -126,8 +153,12 @@ impl DIADataBuilder {
         while current_mz_idx < mz_index.len() {
             // Add all peaks for current mz_idx
             while peak_idx < all_peaks.len() && all_peaks[peak_idx].0 == current_mz_idx {
-                let (_, cycle_idx, intensity) = all_peaks[peak_idx];
-                obs.add_peak_data(cycle_idx, intensity);
+                let (_, cycle_idx, scan_idx, intensity) = all_peaks[peak_idx];
+                if has_mobility {
+                    obs.add_peak_data_im(cycle_idx, scan_idx, intensity);
+                } else {
+                    obs.add_peak_data(cycle_idx, intensity);
+                }
                 peak_idx += 1;
             }
 
