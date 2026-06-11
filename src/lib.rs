@@ -9,6 +9,7 @@ mod convolution;
 mod dense_xic_observation;
 pub mod dia_data;
 pub mod dia_data_builder;
+pub mod fdr;
 pub mod idf;
 mod kernel;
 mod mz_index;
@@ -105,5 +106,8 @@ fn alphadia_search_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_current_simd_backend, m)?)?;
     m.add_function(wrap_pyfunction!(set_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(get_num_threads, m)?)?;
+    m.add_function(wrap_pyfunction!(fdr::fdr_q_values, m)?)?;
+    m.add_function(wrap_pyfunction!(fdr::fdr_keep_best, m)?)?;
+    m.add_function(wrap_pyfunction!(fdr::fdr_finalize, m)?)?;
     Ok(())
 }
