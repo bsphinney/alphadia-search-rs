@@ -116,12 +116,29 @@ impl PeakGroupScoring {
         let cycle_stop_idx = candidate.cycle_stop;
         let mass_tolerance = self.params.mass_tolerance;
 
+        // Ion-mobility window for dia-PASEF: restrict extraction to the candidate's
+        // mobility band. For mobility-agnostic data (or when the candidate carries
+        // no usable scan window) we extract the full scan range, which the
+        // mobility-windowed fillers treat as a no-op.
+        let (scan_start, scan_stop) = if dia_data.has_mobility() {
+            if candidate.scan_stop > candidate.scan_start {
+                (candidate.scan_start, candidate.scan_stop)
+            } else {
+                // No usable per-candidate window: fall back to the full mobility range.
+                (0usize, dia_data.num_scans())
+            }
+        } else {
+            (0usize, 1usize)
+        };
+
         // Create dense XIC and m/z observation using the filtered precursor fragments
         let dense_xic_mz_obs = DenseXICMZObservation::new(
             dia_data,
             precursor.mz,
             cycle_start_idx,
             cycle_stop_idx,
+            scan_start,
+            scan_stop,
             mass_tolerance,
             &precursor.fragment_mz,
         );

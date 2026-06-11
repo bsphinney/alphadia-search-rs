@@ -241,6 +241,60 @@ impl QuadrupoleObservation {
         }
     }
 
+    /// IM-aware version of `fill_xic_and_mz_slice`: accumulates intensity and an
+    /// intensity-weighted observed m/z into 1D `[cycle]` profiles, restricted to
+    /// the mobility window `[scan_start, scan_stop)`. When the observation has no
+    /// mobility the scan window is ignored (equivalent to the trait method).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_xic_and_mz_slice_mobility_windowed(
+        &self,
+        mz_index: &MZIndex,
+        dense_xic: &mut ArrayViewMut1<f32>,
+        dense_mz: &mut ArrayViewMut1<f32>,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) {
+        let has_mob = self.has_mobility();
+        let delta_mz = mz * mass_tolerance * 1e-6;
+        let lower_mz = mz - delta_mz;
+        let upper_mz = mz + delta_mz;
+
+        for mz_idx in mz_index.mz_range_indices(lower_mz, upper_mz) {
+            let actual_mz = mz_index.mz[mz_idx];
+            let start = self.slice_starts[mz_idx] as usize;
+            let stop = self.slice_starts[mz_idx + 1] as usize;
+            for i in start..stop {
+                let cycle_idx = self.cycle_indices[i] as usize;
+                if cycle_idx < cycle_start_idx || cycle_idx >= cycle_stop_idx {
+                    continue;
+                }
+                if has_mob {
+                    let scan_idx = self.scan_indices[i] as usize;
+                    if scan_idx < scan_start || scan_idx >= scan_stop {
+                        continue;
+                    }
+                }
+                let relative_idx = cycle_idx - cycle_start_idx;
+                let intensity = self.intensities[i];
+                dense_xic[relative_idx] += intensity;
+                if intensity > 0.0 {
+                    let prev_total = dense_xic[relative_idx] - intensity;
+                    if prev_total == 0.0 {
+                        dense_mz[relative_idx] = actual_mz;
+                    } else {
+                        dense_mz[relative_idx] = (dense_mz[relative_idx] * prev_total
+                            + actual_mz * intensity)
+                            / dense_xic[relative_idx];
+                    }
+                }
+            }
+        }
+    }
+
     /// Calculate memory footprint of this optimized observation
     pub fn memory_footprint_bytes(&self) -> usize {
         let mut total_size = 0;
@@ -345,5 +399,79 @@ impl crate::traits::QuadrupoleObservationTrait for QuadrupoleObservation {
                 }
             }
         }
+    }
+
+    fn fill_dense_xic_3d_trait(
+        &self,
+        mz_index: &crate::mz_index::MZIndex,
+        dense_xic_2d: &mut numpy::ndarray::ArrayViewMut2<f32>,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) {
+        self.fill_dense_xic_3d(
+            mz_index,
+            dense_xic_2d,
+            cycle_start_idx,
+            cycle_stop_idx,
+            scan_start,
+            scan_stop,
+            mass_tolerance,
+            mz,
+        )
+    }
+
+    fn fill_xic_slice_mobility_windowed(
+        &self,
+        mz_index: &crate::mz_index::MZIndex,
+        dense_xic: &mut numpy::ndarray::ArrayViewMut1<f32>,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) {
+        // call the inherent method (same name) explicitly
+        QuadrupoleObservation::fill_xic_slice_mobility_windowed(
+            self,
+            mz_index,
+            dense_xic,
+            cycle_start_idx,
+            cycle_stop_idx,
+            scan_start,
+            scan_stop,
+            mass_tolerance,
+            mz,
+        )
+    }
+
+    fn fill_xic_and_mz_slice_mobility_windowed(
+        &self,
+        mz_index: &crate::mz_index::MZIndex,
+        dense_xic: &mut numpy::ndarray::ArrayViewMut1<f32>,
+        dense_mz: &mut numpy::ndarray::ArrayViewMut1<f32>,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) {
+        QuadrupoleObservation::fill_xic_and_mz_slice_mobility_windowed(
+            self,
+            mz_index,
+            dense_xic,
+            dense_mz,
+            cycle_start_idx,
+            cycle_stop_idx,
+            scan_start,
+            scan_stop,
+            mass_tolerance,
+            mz,
+        )
     }
 }

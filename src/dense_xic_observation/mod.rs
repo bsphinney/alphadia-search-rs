@@ -22,16 +22,21 @@ pub struct DenseXICObservation {
 }
 
 impl DenseXICObservation {
-    /// Create a new DenseXICObservation from DIA data and parameters
+    /// Create a new DenseXICObservation from DIA data and parameters.
     ///
-    /// This constructor pattern allows for zero-cost abstractions and full
-    /// compiler optimization through monomorphization.
+    /// For mobility-agnostic data this behaves exactly as before. For timsTOF /
+    /// dia-PASEF data it restricts the extraction to the candidate's ion-mobility
+    /// window `[scan_start, scan_stop)` — the dia-PASEF selectivity that the
+    /// previous 2D path discarded by integrating the full mobility range.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T: DIADataTrait>(
         dia_data: &T,
         precursor_mz: f32,
         cycle_start_idx: usize,
         cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
         mass_tolerance: f32,
         fragment_mz: &[f32], // Use slice for better performance
     ) -> Self {
@@ -43,11 +48,13 @@ impl DenseXICObservation {
             let obs = &dia_data.quadrupole_observations()[obs_idx];
 
             for (f_idx, &f_mz) in fragment_mz.iter().enumerate() {
-                obs.fill_xic_slice(
+                obs.fill_xic_slice_mobility_windowed(
                     dia_data.mz_index(),
                     &mut dense_xic.row_mut(f_idx),
                     cycle_start_idx,
                     cycle_stop_idx,
+                    scan_start,
+                    scan_stop,
                     mass_tolerance,
                     f_mz,
                 );
@@ -89,17 +96,19 @@ pub struct DenseXICMZObservation {
 }
 
 impl DenseXICMZObservation {
-    /// Create a new DenseXICMZObservation from DIA data and parameters
+    /// Create a new DenseXICMZObservation from DIA data and parameters.
     ///
-    /// This constructor pattern allows for zero-cost abstractions and full
-    /// compiler optimization through monomorphization.
+    /// IM-aware: restricts extraction to `[scan_start, scan_stop)` for timsTOF
+    /// data (no-op scan window for mobility-agnostic data).
     #[inline]
-    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T: DIADataTrait>(
         dia_data: &T,
         precursor_mz: f32,
         cycle_start_idx: usize,
         cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
         mass_tolerance: f32,
         fragment_mz: &[f32], // Use slice for better performance
     ) -> Self {
@@ -114,12 +123,14 @@ impl DenseXICMZObservation {
             let obs = &dia_data.quadrupole_observations()[obs_idx];
 
             for (f_idx, &f_mz) in fragment_mz.iter().enumerate() {
-                obs.fill_xic_and_mz_slice(
+                obs.fill_xic_and_mz_slice_mobility_windowed(
                     dia_data.mz_index(),
                     &mut dense_xic.row_mut(f_idx),
                     &mut dense_mz.row_mut(f_idx),
                     cycle_start_idx,
                     cycle_stop_idx,
+                    scan_start,
+                    scan_stop,
                     mass_tolerance,
                     f_mz,
                 );

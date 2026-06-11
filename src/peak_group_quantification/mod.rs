@@ -96,11 +96,24 @@ impl PeakGroupQuantification {
             return None;
         }
 
+        // Ion-mobility window (dia-PASEF): restrict to the candidate's mobility band.
+        let (scan_start, scan_stop) = if dia_data.has_mobility() {
+            if candidate.scan_stop > candidate.scan_start {
+                (candidate.scan_start, candidate.scan_stop)
+            } else {
+                (0usize, dia_data.num_scans())
+            }
+        } else {
+            (0usize, 1usize)
+        };
+
         let dense_xic_mz_obs = DenseXICMZObservation::new(
             dia_data,
             precursor.mz,
             cycle_start,
             cycle_stop,
+            scan_start,
+            scan_stop,
             self.params.tolerance_ppm,
             &precursor.fragment_mz,
         );
