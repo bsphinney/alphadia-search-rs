@@ -32,6 +32,7 @@ impl DIADataBuilder {
             cycle: alpha_raw_view.cycle.to_owned(),
             num_scans: alpha_raw_view.num_scans,
             has_mobility: alpha_raw_view.has_mobility(),
+            mobility_per_scan: Vec::new(),
         }
     }
 

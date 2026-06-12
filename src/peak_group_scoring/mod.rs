@@ -131,6 +131,20 @@ impl PeakGroupScoring {
             (0usize, 1usize)
         };
 
+        // Ion-mobility features (dia-PASEF): observed 1/K0 at the candidate's
+        // mobility apex scan, and the delta vs the library-predicted 1/K0.
+        // 0.0 when the data or library lacks mobility (then these are no-ops for FDR).
+        let mobility_observed = if dia_data.has_mobility() {
+            dia_data.mobility_of_scan(candidate.scan_center)
+        } else {
+            0.0
+        };
+        let delta_mobility = if dia_data.has_mobility() && precursor.mobility > 0.0 {
+            mobility_observed - precursor.mobility
+        } else {
+            0.0
+        };
+
         // Create dense XIC and m/z observation using the filtered precursor fragments
         let dense_xic_mz_obs = DenseXICMZObservation::new(
             dia_data,
@@ -354,6 +368,8 @@ impl PeakGroupScoring {
             num_profiles_filtered as f32,
             num_over_0_top6_idf as f32,
             num_over_50_top6_idf as f32,
+            mobility_observed,
+            delta_mobility,
         ))
     }
 }

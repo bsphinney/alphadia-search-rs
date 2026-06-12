@@ -4,6 +4,8 @@ pub struct Precursor {
     pub mz_library: f32,
     pub rt: f32,
     pub rt_library: f32,
+    /// Predicted/library ion mobility (1/K0). 0.0 when not provided.
+    pub mobility: f32,
     pub naa: u8,
     pub fragment_mz: Vec<f32>,
     pub fragment_mz_library: Vec<f32>,

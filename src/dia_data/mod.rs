@@ -24,6 +24,9 @@ pub struct DIAData {
     pub cycle: Array4<f32>,
     pub num_scans: usize,
     pub has_mobility: bool,
+    /// Per-scan ion-mobility (1/K0) values, length == num_scans (timsTOF). Empty
+    /// for mobility-agnostic data. Set via `set_mobility_values` after construction.
+    pub mobility_per_scan: Vec<f32>,
 }
 
 impl Default for DIAData {
@@ -43,7 +46,14 @@ impl DIAData {
             cycle: Array4::zeros((0, 0, 0, 0)),
             num_scans: 1,
             has_mobility: false,
+            mobility_per_scan: Vec::new(),
         }
+    }
+
+    /// Set the per-scan ion-mobility (1/K0) values (length should equal num_scans).
+    /// Used by the timsTOF feeder to provide real mobility for mobility-error scoring.
+    pub fn set_mobility_values(&mut self, mobility_values: Vec<f32>) {
+        self.mobility_per_scan = mobility_values;
     }
 
     #[staticmethod]
@@ -175,11 +185,12 @@ impl DIAData {
 
     #[getter]
     pub fn mobility_values(&self) -> Vec<f32> {
-        // Kept for API compatibility. The Rust extraction works in scan-index
-        // space; absolute 1/K0 mobility values live on the Python side and are
-        // not required by the scorer. Return a 2-element placeholder for the
-        // non-IM case (historical behavior) or a length-num_scans ramp for IM.
-        if self.has_mobility {
+        // Returns the real per-scan 1/K0 values when provided (via
+        // set_mobility_values); otherwise a scan-index ramp for IM data or the
+        // historical 2-element placeholder for mobility-agnostic data.
+        if !self.mobility_per_scan.is_empty() {
+            self.mobility_per_scan.clone()
+        } else if self.has_mobility {
             (0..self.num_scans).map(|s| s as f32).collect()
         } else {
             vec![1e-6, 0.0]
@@ -227,6 +238,14 @@ impl crate::traits::DIADataTrait for DIAData {
 
     fn num_scans(&self) -> usize {
         self.num_scans
+    }
+
+    fn mobility_of_scan(&self, scan_idx: usize) -> f32 {
+        if scan_idx < self.mobility_per_scan.len() {
+            self.mobility_per_scan[scan_idx]
+        } else {
+            0.0
+        }
     }
 }
 

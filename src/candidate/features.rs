@@ -45,6 +45,8 @@ pub const FEATURE_NAMES: &[&str] = &[
     "num_profiles_filtered",
     "num_over_0_top6_idf",
     "num_over_50_top6_idf",
+    "mobility_observed",
+    "delta_mobility",
 ];
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,10 @@ pub struct CandidateFeature {
     pub num_profiles_filtered: f32,
     pub num_over_0_top6_idf: f32,
     pub num_over_50_top6_idf: f32,
+    /// Observed ion mobility (1/K0) at the candidate's mobility apex scan. 0.0 if no IM.
+    pub mobility_observed: f32,
+    /// Observed minus predicted ion mobility (1/K0). 0.0 if no IM/library mobility.
+    pub delta_mobility: f32,
 }
 
 impl CandidateFeature {
@@ -140,6 +146,8 @@ impl CandidateFeature {
         num_profiles_filtered: f32,
         num_over_0_top6_idf: f32,
         num_over_50_top6_idf: f32,
+        mobility_observed: f32,
+        delta_mobility: f32,
     ) -> Self {
         Self {
             precursor_idx,
@@ -185,6 +193,8 @@ impl CandidateFeature {
             num_profiles_filtered,
             num_over_0_top6_idf,
             num_over_50_top6_idf,
+            mobility_observed,
+            delta_mobility,
         }
     }
 }
@@ -263,6 +273,8 @@ impl CandidateFeatureCollection {
         let mut num_profiles_filtered = Array1::<f32>::zeros(n);
         let mut num_over_0_top6_idf = Array1::<f32>::zeros(n);
         let mut num_over_50_top6_idf = Array1::<f32>::zeros(n);
+        let mut mobility_observed = Array1::<f32>::zeros(n);
+        let mut delta_mobility = Array1::<f32>::zeros(n);
 
         for (i, feature) in self.features.iter().enumerate() {
             precursor_idxs[i] = feature.precursor_idx as u64;
@@ -308,6 +320,8 @@ impl CandidateFeatureCollection {
             num_profiles_filtered[i] = feature.num_profiles_filtered;
             num_over_0_top6_idf[i] = feature.num_over_0_top6_idf;
             num_over_50_top6_idf[i] = feature.num_over_50_top6_idf;
+            mobility_observed[i] = feature.mobility_observed;
+            delta_mobility[i] = feature.delta_mobility;
         }
 
         let dict = PyDict::new(py);
@@ -405,6 +419,8 @@ impl CandidateFeatureCollection {
             "num_over_50_top6_idf",
             num_over_50_top6_idf.into_pyarray(py),
         )?;
+        dict.set_item("mobility_observed", mobility_observed.into_pyarray(py))?;
+        dict.set_item("delta_mobility", delta_mobility.into_pyarray(py))?;
 
         Ok(dict.into())
     }

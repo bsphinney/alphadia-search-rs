@@ -32,6 +32,12 @@ pub trait DIADataTrait {
     fn num_scans(&self) -> usize {
         1
     }
+
+    /// Map an ion-mobility scan index to its 1/K0 value. Returns 0.0 when no
+    /// per-scan mobility is available (mobility-agnostic data or not provided).
+    fn mobility_of_scan(&self, _scan_idx: usize) -> f32 {
+        0.0
+    }
 }
 
 /// Trait for quadrupole observation types that support XIC slice filling
