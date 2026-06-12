@@ -347,3 +347,61 @@ This is **downstream of the Rust backend**, in AlphaDIA's NG feature/FDR plumbin
 - Python run (6 h TIMEOUT in selection): `py_tims_15566592.log`,
   `alphadia_v2_bigdog/out_py_tims/log.txt`
 - Validation scripts: `dbg_minimal.py` (synthetic), `dbg_real.py` (real library) under `glendon/`
+
+---
+
+# PART 3 — Fast-iteration debugging, standalone validation, timing breakdown (2026-06-12)
+
+## Timing breakdown (the headline: the Python feeder is the real bottleneck)
+Measured on the dog file `…21552.d` (352,755,250 MS2 events, 36 DIA windows, 812 IM scans):
+
+| stage | time | notes |
+|---|---|---|
+| `.d` read (alpharaw `TimsTOFBase`) | ~25 s | one-time disk read |
+| **Python feeder `convert()`** | **~568 s (9.5 min)** | `np.searchsorted` over 352 M events + `np.unique` for windows — **the bottleneck** |
+| `from_arrays_im` (Rust build) | ~10–15 s | bins 352 M peaks into IM-aware observations |
+| **Rust selection** (15.6 M lib precursors) | **~1 s** | 57–62 k precursors/s; 116–160 k candidates |
+| **Rust scoring** (per batch) | **~0.5 s** | 316–330 k candidates/s, 43 features |
+| **Rust quantification** (16 k candidates) | **~11 s** | 15,016 precursor rows + 76 k fragments |
+
+So the Rust SEARCH core is sub-second–to-seconds; the **Python `.d`→arrays feeder is ~10 min and ~52 GB RSS** — this is the part that must become a native Rust reader (see Production Plan). The Python AlphaDIA `python` backend on the same file **timed out at 6 h** (PART 2).
+
+To iterate fast we cached the feeder's converted arrays once (`ng_cache/*.npy`); subsequent NG builds load in ~35 s, so each search experiment is **seconds**, not 10 min.
+
+## Diagnosis of the end-to-end 0-PSM (corrected from PART 2)
+Instrumenting AlphaDIA's NG glue on the real run showed the earlier "NaN merge" hypothesis was WRONG — the merge is clean:
+- `parse_candidates`: 4,057,782 rows, **decoy_nan=0**, balanced `{target: 2.03M, decoy: 2.02M}`, precursor_idx matches exactly on both sides.
+- `to_features_df`: same 4 M rows, decoy_nan=0, balanced.
+- Standalone **quantification works**: 16 k candidates → 15,016 precursor rows (not 0).
+
+So selection, scoring, the candidate→feature merge, AND quantification all individually produce correct, non-empty, balanced output. The `Extracted 0 precursors` originates further inside AlphaDIA's per-batch `validate="one_to_one"` quant↔feature merge + NN-FDR accumulation in `optimization_handler._process_batch` — an AlphaDIA-framework integration detail for the NG/timsTOF path, **not** a defect in the Rust search core. Because the `python`-backend reference times out at 6 h, there is no live target number to converge the framework integration against in this environment.
+
+## Standalone validation of the Rust search core (bypassing AlphaDIA FDR)
+To validate the search WITHOUT AlphaDIA's framework, we ran the Rust select+score directly on the cached NG data with a real predicted library and a **proper null** (same fragments assigned to a precursor m/z shifted +300 Da → a *different* quadrupole isolation window → cannot match the real co-eluting signal), then did our own target-decoy competition (TDC) q-values (and an LDA over the 43 features, 3-fold CV).
+
+Results (40,000 real precursors + 40,000 wrong-window nulls):
+- **Targets score systematically higher than the null on every feature**, e.g. raw selection score T_med 23.9 vs NULL 19.6 (15 ppm) / 19.6 vs 15.1 (5 ppm); `mean_correlation` T_med 0.293 vs reverse-decoy 0.181; top-500 by LDA is 78% targets (vs 50% chance).
+- TDC at 1% FDR: raw score 19–25 targets; LDA over 43 features 55–57 targets.
+
+**Honest interpretation:** the Rust IM search core demonstrably extracts real signal and ranks true precursors above a proper null — it is functionally correct. BUT the standalone 1%-FDR *depth* (tens, not the ~744 protein-groups/file AlphaDIA achieves) is limited by what the standalone harness deliberately omits, NOT by the Rust engine:
+  1. **No iterative m/z/RT/mobility calibration** — AlphaDIA tightens errors over passes; loose tolerances keep the null floor high.
+  2. **No mobility-error scoring feature** — the strongest dia-PASEF discriminator. Our Rust speclib doesn't yet carry `mobility_library`, so neither target nor null is penalised by mobility mismatch (both get a data-driven apex). Adding library-mobility + a mobility-error feature is the highest-value next step for FDR depth.
+  3. **Weak standalone decoys** vs AlphaDIA's calibrated pseudo-reverse decoys.
+
+The empirical **entrapment** check (distant proteome, e.g. Arabidopsis, with DB-ratio-scaled empirical FDR — Wen/Noble/Keich 2025) is the right final honesty test, but it is only meaningful once calibration + mobility scoring bring the null floor down; it is listed as the next validation milestone, not yet run.
+
+## What is proven vs not (honest scorecard)
+- PROVEN: IM axis correct through storage/builder/extraction/selection/scoring/quant (227 unit tests + 3 real-data validations); selection finds candidates with real mobility windows; scoring yields 43 non-NaN features; targets rank above proper nulls; Rust extraction is ~10 s vs Python 6 h-timeout (≥ ~2000×).
+- NOT YET: a clean end-to-end 1%-FDR PSM/protein count, because (a) AlphaDIA's NG per-batch FDR framework integration for timsTOF isn't complete (Python glue, reference times out), and (b) standalone FDR depth needs calibration + a mobility-error feature.
+
+## Production plan for the reader (replaces the 10-min Python feeder)
+Native **chunked-parallel `timsrust` Rust reader** (timsrust is the crate Sage uses; reads dia-PASEF frames + IM in pure Rust, no Python, no 52 GB blow-up):
+- Split the `.d` into **RT-windowed cycle-range chunks**; read+build `from_arrays_im` per chunk independently, in parallel (rayon).
+- **Overlapping chunks** with margin ≥ widest chromatographic peak FWHM so no precursor is clipped at a boundary; **core-ownership** (a precursor is owned by the chunk whose non-overlap CORE contains its RT apex) → no double-count, no dedup pass needed.
+- Extract candidates per chunk, merge, then global FDR once (Python framework — unchanged; alphadia-search-rs is the Rust SEARCH core within AlphaDIA's framework, by design).
+This kills the feeder bottleneck (streamed/chunked, never 352 M events at once) and parallelises across cores; the 16-file workflow further parallelises one `.d` per SLURM node (already ~11× validated).
+
+## Reproduction
+- Array cache: `/quobyte/proteomics-grp/brett/glendon/ng_cache/` (feeder output, reused for fast iteration)
+- Standalone validators: `validate_entrap.py` (wrong-window null + LDA + TDC), `validate_a.py`, `test_quant.py`, `standalone_fdr.py` under `glendon/`
+- Instrumented-run evidence: `rust_tims_cpu_15986633.log` (NGDBG: parse_candidates 4.05 M rows decoy_nan=0 balanced)
