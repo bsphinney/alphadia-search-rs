@@ -14,10 +14,21 @@ impl DIADataBuilder {
         // Single-phase parallel observation building
         let quadrupole_observations = Self::build_observations_rayon_parallel(alpha_raw_view);
 
+        // For mobility data the per-spectrum rt array is not a clean per-cycle RT
+        // axis (MS1 markers + many MS2 windows), so expose the per-cycle rt_index
+        // as `rt_values`. alphadia's _norm_to_rt uses rt_values[0]/[-1] as the RT
+        // bounds, which must be the sorted first/last cycle RT. For mobility-
+        // agnostic data we keep the historical per-spectrum array.
+        let rt_values = if alpha_raw_view.has_mobility() {
+            rt_index.rt.to_owned()
+        } else {
+            alpha_raw_view.spectrum_rt.to_owned()
+        };
+
         DIAData {
             rt_index,
             quadrupole_observations,
-            rt_values: alpha_raw_view.spectrum_rt.to_owned(),
+            rt_values,
             cycle: alpha_raw_view.cycle.to_owned(),
             num_scans: alpha_raw_view.num_scans,
             has_mobility: alpha_raw_view.has_mobility(),
