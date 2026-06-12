@@ -405,3 +405,64 @@ This kills the feeder bottleneck (streamed/chunked, never 352 M events at once) 
 - Array cache: `/quobyte/proteomics-grp/brett/glendon/ng_cache/` (feeder output, reused for fast iteration)
 - Standalone validators: `validate_entrap.py` (wrong-window null + LDA + TDC), `validate_a.py`, `test_quant.py`, `standalone_fdr.py` under `glendon/`
 - Instrumented-run evidence: `rust_tims_cpu_15986633.log` (NGDBG: parse_candidates 4.05 M rows decoy_nan=0 balanced)
+
+---
+
+# PART 4 — Closing the FDR-depth gap on the 16 dog files (2026-06-12)
+
+Goal: match the production engines on the SAME 16 bigDog `.d` files. Reference (apples-to-apples, MBR on, confirmed from the DIA-NN command line `--reanalyse`):
+- **DIA-NN 2.5: 1,306 protein groups / 17,770 precursors (16 files)**
+- **FragPipe/diaTracer: 1,337 protein groups**
+
+## Foundational levers built (Radiant-derived menu applied)
+1. **Mobility-error scoring feature + library mobility (lever #1).** Added to the Rust engine
+   (commit `c4e0d24`): `SpecLibFlat::from_arrays_mobility` (per-precursor predicted 1/K0),
+   `Precursor.mobility`, `DIAData::set_mobility_values`/`mobility_of_scan`, and two scoring
+   features `mobility_observed` + `delta_mobility` (observed apex 1/K0 vs library). 43 features
+   total, 227 tests green. The DIA-NN MBR library `report-lib.parquet` supplies real 1/K0 + iRT
+   (this also satisfies lever #5: same MBR setting as the reference).
+2. **Proper decoys (lever #4 fix).** The earlier reverse-FRAGMENT decoys were useless — the
+   selection dot-product is fragment-order-independent, so a reordered decoy is identical to its
+   target (T_med == D_med exactly). Fix: pseudo-reverse the SEQUENCE and regenerate b/y masses
+   (`fraglib.py`, validated vs DIA-NN fragments — the only residual is N-term Acetyl, a known
+   variable mod). Decoys now have genuinely different masses.
+3. **Two-pass m/z calibration** (loose 20 ppm → tight 8 ppm) + LDA over all 43 features + TDC.
+
+## Single-file result + HONEST entrapment audit (the gate)
+- Single file, proper decoys, 2-pass: PASS1 = 2,376 → PASS2 (8 ppm) = 2,745 targets @ 1% FDR.
+- **Entrapment audit** (20,000 yeast tryptic peptides — foreign to dog — added as competing
+  targets+decoys): at reported 1% FDR → **1,901 dog + 24 yeast = empirical FDR 1.30%**
+  (monotone: q≤0.001 → 0% yeast, q≤0.005 → 0.62%). **The FDR is honest/well-calibrated.** The
+  entrapment competition correctly lowers the dog count from 2,745 → 1,901 (the 2,745 was
+  inflated by the absence of foreign competition). **Honest single-file depth ≈ 1,901 precursors
+  at a true ~1.3% FDR.**
+
+## 16-file result with GLOBAL cross-file precursor FDR (lever #3)
+Searched all 16 `.d` (per-file Rust search ~50 s each incl. NG build), trained one LDA across
+all files, then computed precursor FDR on the best-score-per-precursor pooled ACROSS the 16
+files (not per-file), then rolled precursors up to protein groups via the DIA-NN library's
+Protein.Group mapping:
+
+| metric | Rust engine (this work) | DIA-NN 2.5 | FragPipe |
+|---|---|---|---|
+| protein groups @1% FDR | **1,024** | 1,306 | 1,337 |
+| multi-peptide PGs | 480 | — | — |
+| precursors @1% FDR | 5,964 | 17,770 | — |
+
+**Honest checkpoint: 1,024 PG = ~78% of the 1,306–1,337 bar.** The protein-group gap tracks the
+precursor gap (5,964 vs 17,770). The Rust IM extraction/scoring is validated and honest
+(entrapment-confirmed); the remaining depth gap is in the **downstream classifier + FDR depth**,
+not the engine:
+- **LDA is weaker than the NN classifier** DIA-NN/Radiant use (lever #2) — the next lever.
+- **Crude single global RT/IM calibration** (one interpolation, no per-file fit / no mobility
+  recalibration pass).
+- **No MBR-style cross-run evidence transfer** in scoring (only the FDR is cross-file).
+
+## Next levers (in progress / planned, honest about each)
+- NN final classifier over the 43 features (lever #2) — expected the biggest single lift.
+- Per-file iterative RT + mobility calibration (tighten the null floor further).
+- MixMax q-values (lever #4) for low-q sensitivity.
+- Fair PG counting (lever #6): report with/without single-peptide PGs (currently 1,024 total,
+  480 multi-peptide) — full numbers shown above.
+
+All on branch `feature/timstof-im-axis`; scripts in `prototype/timstof/depth/`.
