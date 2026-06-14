@@ -9,6 +9,11 @@ impl FragmentType {
     pub const Z: u8 = 122; // ascii value for 'z'
 }
 
+/// Mass difference between a 13C and a 12C atom (Da). The spacing between
+/// adjacent isotopologue peaks of a charge-z precursor is `C13_C12 / z` in m/z.
+/// Value from CODATA/IUPAC atomic masses (13C 13.0033548 - 12C 12.0000000).
+pub const C13_C12: f32 = 1.0033548;
+
 pub struct Loss;
 
 impl Loss {

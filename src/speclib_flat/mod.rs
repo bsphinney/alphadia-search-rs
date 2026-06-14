@@ -29,6 +29,12 @@ pub struct SpecLibFlat {
     /// Empty when the library has no mobility (mobility-agnostic / non-timsTOF).
     precursor_mobility: Vec<f32>,
 
+    /// Precursor charge state per precursor, sorted by precursor_idx. Empty when
+    /// not provided (then `Precursor.charge` is 0 and the isotope features skip).
+    /// Set via `set_precursor_charge` after construction (kept additive so the
+    /// existing `from_arrays`/`from_arrays_mobility` callers are unchanged).
+    precursor_charge: Vec<u8>,
+
     /// Number of amino acids in the precursor sequence, sorted according to precursor_idx order
     precursor_naa: Vec<u8>,
 
@@ -84,6 +90,7 @@ impl SpecLibFlat {
             precursor_rt_library: Vec::new(),
             precursor_rt: Vec::new(),
             precursor_mobility: Vec::new(),
+            precursor_charge: Vec::new(),
             precursor_naa: Vec::new(),
             flat_frag_start_idx: Vec::new(),
             flat_frag_stop_idx: Vec::new(),
@@ -177,6 +184,7 @@ impl SpecLibFlat {
             precursor_rt_library: sorted_precursor_rt_library,
             precursor_rt: sorted_precursor_rt,
             precursor_mobility: Vec::new(),
+            precursor_charge: Vec::new(),
             precursor_naa: sorted_precursor_naa,
             flat_frag_start_idx: sorted_flat_frag_start_idx,
             flat_frag_stop_idx: sorted_flat_frag_stop_idx,
@@ -247,6 +255,28 @@ impl SpecLibFlat {
         indices.sort_by_key(|&i| idx_vec[i]);
         lib.precursor_mobility = indices.iter().map(|&i| mob_vec[i]).collect();
         lib
+    }
+
+    /// Attach per-precursor charge states (A1: isotopologue features need the
+    /// C13 m/z spacing = C13_C12 / charge). `precursor_idx` must be the ORIGINAL
+    /// (pre-sort) precursor_idx array that was passed to `from_arrays*`; this
+    /// reproduces the same sort permutation so charge lines up with the
+    /// internally-sorted precursor arrays. Additive: callers that don't call
+    /// this leave charge empty and `Precursor.charge` is 0 (isotope no-op).
+    pub fn set_precursor_charge(
+        &mut self,
+        precursor_idx: PyReadonlyArray1<'_, usize>,
+        precursor_charge: PyReadonlyArray1<'_, u8>,
+    ) {
+        let idx_vec = precursor_idx.as_array().to_vec();
+        let chg_vec = precursor_charge.as_array().to_vec();
+        if idx_vec.len() != chg_vec.len() || idx_vec.len() != self.precursor_mz.len() {
+            // shape mismatch: leave charge empty (safe no-op)
+            return;
+        }
+        let mut indices: Vec<usize> = (0..idx_vec.len()).collect();
+        indices.sort_by_key(|&i| idx_vec[i]);
+        self.precursor_charge = indices.iter().map(|&i| chg_vec[i]).collect();
     }
 
     #[getter]
@@ -415,6 +445,7 @@ impl SpecLibFlat {
         let precursor_rt = self.precursor_rt[index];
         let precursor_rt_library = self.precursor_rt_library[index];
         let precursor_mobility = self.precursor_mobility.get(index).copied().unwrap_or(0.0);
+        let precursor_charge = self.precursor_charge.get(index).copied().unwrap_or(0);
         let precursor_naa = self.precursor_naa[index];
         let start_idx = self.flat_frag_start_idx[index];
         let stop_idx = self.flat_frag_stop_idx[index];
@@ -436,6 +467,7 @@ impl SpecLibFlat {
             rt: precursor_rt,
             rt_library: precursor_rt_library,
             mobility: precursor_mobility,
+            charge: precursor_charge,
             naa: precursor_naa,
             fragment_mz,
             fragment_mz_library,
@@ -462,6 +494,7 @@ impl SpecLibFlat {
         let precursor_rt = self.precursor_rt[index];
         let precursor_rt_library = self.precursor_rt_library[index];
         let precursor_mobility = self.precursor_mobility.get(index).copied().unwrap_or(0.0);
+        let precursor_charge = self.precursor_charge.get(index).copied().unwrap_or(0);
         let precursor_naa = self.precursor_naa[index];
         let start_idx = self.flat_frag_start_idx[index];
         let stop_idx = self.flat_frag_stop_idx[index];
@@ -508,6 +541,7 @@ impl SpecLibFlat {
             rt: precursor_rt,
             rt_library: precursor_rt_library,
             mobility: precursor_mobility,
+            charge: precursor_charge,
             naa: precursor_naa,
             fragment_mz,
             fragment_mz_library,

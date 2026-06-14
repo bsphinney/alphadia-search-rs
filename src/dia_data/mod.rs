@@ -3,6 +3,7 @@ use numpy::{PyArray1, PyArray4, PyReadonlyArray1, PyReadonlyArray4};
 use pyo3::{prelude::*, Bound};
 mod alpha_raw_view;
 use crate::dia_data_builder::DIADataBuilder;
+use crate::ms1_observation::Ms1Observation;
 use crate::mz_index::MZIndex;
 use crate::quadrupole_observation::QuadrupoleObservation;
 use crate::rt_index::RTIndex;
@@ -27,6 +28,11 @@ pub struct DIAData {
     /// Per-scan ion-mobility (1/K0) values, length == num_scans (timsTOF). Empty
     /// for mobility-agnostic data. Set via `set_mobility_values` after construction.
     pub mobility_per_scan: Vec<f32>,
+
+    /// MS1 survey-frame peak store (A1). `None` for caches without MS1 arrays
+    /// (then `has_ms1()` is false and scoring is byte-identical to before). Set
+    /// via `set_ms1_arrays` after construction.
+    pub ms1: Option<Ms1Observation>,
 }
 
 impl Default for DIAData {
@@ -47,6 +53,7 @@ impl DIAData {
             num_scans: 1,
             has_mobility: false,
             mobility_per_scan: Vec::new(),
+            ms1: None,
         }
     }
 
@@ -54,6 +61,35 @@ impl DIAData {
     /// Used by the timsTOF feeder to provide real mobility for mobility-error scoring.
     pub fn set_mobility_values(&mut self, mobility_values: Vec<f32>) {
         self.mobility_per_scan = mobility_values;
+    }
+
+    /// Attach the MS1 survey-frame arrays (A1: MS1/isotope scoring features).
+    /// `ms1_mz/ms1_intensity` are parallel peak arrays; `ms1_cycle/ms1_scan` are
+    /// the RT(cycle) and IM(scan) indices (parallel). Builds an m/z-sorted
+    /// `Ms1Observation`. Additive: callers using old caches simply never call
+    /// this, leaving `has_ms1()` false and scoring unchanged.
+    pub fn set_ms1_arrays(
+        &mut self,
+        ms1_mz: PyReadonlyArray1<'_, f32>,
+        ms1_intensity: PyReadonlyArray1<'_, f32>,
+        ms1_cycle: PyReadonlyArray1<'_, i64>,
+        ms1_scan: PyReadonlyArray1<'_, i64>,
+    ) {
+        let mz = ms1_mz.as_array().to_vec();
+        let intensity = ms1_intensity.as_array().to_vec();
+        let cycle: Vec<u32> = ms1_cycle.as_array().iter().map(|&c| c.max(0) as u32).collect();
+        let scan: Vec<u32> = ms1_scan.as_array().iter().map(|&s| s.max(0) as u32).collect();
+        if mz.is_empty() {
+            self.ms1 = None;
+            return;
+        }
+        self.ms1 = Some(Ms1Observation::from_arrays(
+            mz,
+            intensity,
+            cycle,
+            scan,
+            self.num_scans,
+        ));
     }
 
     #[staticmethod]
@@ -160,6 +196,10 @@ impl DIAData {
             total_size += obs.memory_footprint_bytes();
         }
 
+        if let Some(ms1) = &self.ms1 {
+            total_size += ms1.memory_footprint_bytes();
+        }
+
         total_size
     }
 
@@ -175,7 +215,7 @@ impl DIAData {
 
     #[getter]
     pub fn has_ms1(&self) -> bool {
-        false
+        self.ms1.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
     }
 
     #[getter]
@@ -246,6 +286,14 @@ impl crate::traits::DIADataTrait for DIAData {
         } else {
             0.0
         }
+    }
+
+    fn has_ms1(&self) -> bool {
+        self.has_ms1()
+    }
+
+    fn ms1(&self) -> Option<&crate::ms1_observation::Ms1Observation> {
+        self.ms1.as_ref()
     }
 }
 

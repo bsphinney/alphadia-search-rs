@@ -474,3 +474,190 @@ pub fn calculate_fwhm_rt(
 
     0.0
 }
+
+// ============================================================================
+// Spectral-entropy + MS2 similarity panel (predicted-vs-observed fragment ints)
+// Added 2026-06-13 to recover the "scored-out" precursor gap (RUST_DIA_ENGINE §13).
+//
+// All operate on the two already-matched, index-aligned per-fragment intensity
+// vectors the scorer already computes: `obs` = summed observed XIC intensity per
+// library fragment, `lib` = library/predicted fragment intensity. A fragment with
+// obs==0 is unmatched. These add NO new extraction — pure post-match scalars.
+// ============================================================================
+
+/// L1-normalize a slice into a probability vector. Returns None if total<=0.
+fn l1_normalize(v: &[f32]) -> Option<Vec<f64>> {
+    let total: f64 = v.iter().map(|&x| x.max(0.0) as f64).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    Some(v.iter().map(|&x| (x.max(0.0) as f64) / total).collect())
+}
+
+/// Shannon entropy (nats) of an L1-normalized probability vector.
+fn shannon_entropy(p: &[f64]) -> f64 {
+    let mut h = 0.0;
+    for &pi in p {
+        if pi > 0.0 {
+            h -= pi * pi.ln();
+        }
+    }
+    h
+}
+
+/// Spectral entropy similarity (Li et al., Nat Methods 2021) between observed and
+/// library fragment intensities. Defined as
+///   S = 1 - (2*H(p_merged) - H(p_obs) - H(p_lib)) / ln(4)
+/// where p_merged is the L1-normalized element-wise mean of the two normalized
+/// spectra. Returns a value in [0,1]; 1 = identical, 0 = maximally divergent.
+/// Returns 0.0 if either spectrum has no signal.
+pub fn calculate_spectral_entropy_similarity(obs: &[f32], lib: &[f32]) -> f32 {
+    if obs.len() != lib.len() || obs.is_empty() {
+        return 0.0;
+    }
+    let p = match l1_normalize(obs) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    let q = match l1_normalize(lib) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    let merged: Vec<f64> = p.iter().zip(q.iter()).map(|(&a, &b)| 0.5 * (a + b)).collect();
+    let h_merged = shannon_entropy(&merged);
+    let h_p = shannon_entropy(&p);
+    let h_q = shannon_entropy(&q);
+    // Jensen-Shannon entropy distance, normalized to [0,1] by ln(4) = 2*ln(2).
+    let sim = 1.0 - ((2.0 * h_merged - h_p - h_q) / (2.0 * std::f64::consts::LN_2));
+    sim.clamp(0.0, 1.0) as f32
+}
+
+/// Weighted spectral entropy similarity (Li et al., Nat Methods 2021). Each
+/// spectrum is first entropy-weighted: if its Shannon entropy H < 3 nats, every
+/// intensity is raised to the power w = 0.25 + 0.25*H (down-weighting noisy/low-
+/// entropy spectra), then re-normalized, before computing the entropy similarity.
+/// This is the MSBooster "weighted spectral entropy" variant.
+pub fn calculate_weighted_spectral_entropy_similarity(obs: &[f32], lib: &[f32]) -> f32 {
+    if obs.len() != lib.len() || obs.is_empty() {
+        return 0.0;
+    }
+    let reweight = |v: &[f32]| -> Option<Vec<f32>> {
+        let p = l1_normalize(v)?;
+        let h = shannon_entropy(&p);
+        let w = if h < 3.0 { 0.25 + 0.25 * h } else { 1.0 };
+        let pw: Vec<f32> = p.iter().map(|&x| (x.powf(w)) as f32).collect();
+        Some(pw)
+    };
+    let ow = match reweight(obs) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    let lw = match reweight(lib) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    calculate_spectral_entropy_similarity(&ow, &lw)
+}
+
+/// Normalized spectral contrast angle (Prosit / MSBooster). SA = 1 - 2*acos(cos)/pi
+/// where cos is the cosine similarity of the two L1-normalized intensity vectors.
+/// Returns [0,1]; 1 = identical direction.
+pub fn calculate_spectral_angle(obs: &[f32], lib: &[f32]) -> f32 {
+    if obs.len() != lib.len() || obs.is_empty() {
+        return 0.0;
+    }
+    let p = match l1_normalize(obs) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    let q = match l1_normalize(lib) {
+        Some(v) => v,
+        None => return 0.0,
+    };
+    let mut dot = 0.0;
+    let mut np = 0.0;
+    let mut nq = 0.0;
+    for i in 0..p.len() {
+        dot += p[i] * q[i];
+        np += p[i] * p[i];
+        nq += q[i] * q[i];
+    }
+    if np <= 0.0 || nq <= 0.0 {
+        return 0.0;
+    }
+    let cos = (dot / (np.sqrt() * nq.sqrt())).clamp(-1.0, 1.0);
+    let sa = 1.0 - 2.0 * cos.acos() / std::f64::consts::PI;
+    sa.clamp(0.0, 1.0) as f32
+}
+
+/// Fraction of library fragments (intensity>0) that have an observed match (obs>0).
+/// Captures matched-peak coverage independent of intensity agreement.
+pub fn calculate_matched_frag_fraction(obs: &[f32], lib: &[f32]) -> f32 {
+    if obs.len() != lib.len() || obs.is_empty() {
+        return 0.0;
+    }
+    let mut n_lib = 0u32;
+    let mut n_matched = 0u32;
+    for i in 0..lib.len() {
+        if lib[i] > 0.0 {
+            n_lib += 1;
+            if obs[i] > 0.0 {
+                n_matched += 1;
+            }
+        }
+    }
+    if n_lib == 0 {
+        return 0.0;
+    }
+    n_matched as f32 / n_lib as f32
+}
+
+/// The 14 DIA-NN MS1/isotopologue co-elution features (Demichev 2020 Suppl Note 1).
+/// All default to 0.0 — that is the value emitted when MS1 signal is absent
+/// (`has_ms1()` false / old caches), making the whole panel a no-op for the NN.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ms1IsotopeFeatures {
+    /// MS1 co-elution: corr(ref smoothed best-fragment profile, MS1 precursor XIC)
+    /// at base / 0.45*base / 0.2*base mass accuracy (3 scores).
+    pub ms1_coelution_base: f32,
+    pub ms1_coelution_045: f32,
+    pub ms1_coelution_02: f32,
+    /// Isotopologue co-elution: corr(ref profile, MS1 XIC at precursor + 1/2/3 C13)
+    /// at base mass accuracy (3 scores).
+    pub iso_coelution_c13_1: f32,
+    pub iso_coelution_c13_2: f32,
+    pub iso_coelution_c13_3: f32,
+    /// Sum over the top-6 fragments of corr(ref profile, fragment XIC shifted by
+    /// +1 C13 / fragment_charge) — i.e. each fragment's +1 isotopologue (1 score).
+    pub iso_frag_plus_c13_sum: f32,
+    /// Per-fragment ANTI-features: corr(ref profile, fragment XIC shifted by
+    /// -(C13-C12)/charge) for the top-6 fragments (6 scores). High values flag a
+    /// fragment that is actually a heavy isotopologue of a LOWER-mass peak of
+    /// another peptide (interference). Padded with 0.0 if fewer than 6 fragments.
+    pub iso_frag_minus_c13: [f32; 6],
+    /// Sum of the 6 anti-feature correlations (1 score).
+    pub iso_frag_minus_c13_sum: f32,
+}
+
+impl Ms1IsotopeFeatures {
+    /// Flatten to the 14 feature values in the canonical order used by
+    /// `FEATURE_NAMES` / `CandidateFeature`.
+    pub fn as_array(&self) -> [f32; 14] {
+        [
+            self.ms1_coelution_base,
+            self.ms1_coelution_045,
+            self.ms1_coelution_02,
+            self.iso_coelution_c13_1,
+            self.iso_coelution_c13_2,
+            self.iso_coelution_c13_3,
+            self.iso_frag_plus_c13_sum,
+            self.iso_frag_minus_c13[0],
+            self.iso_frag_minus_c13[1],
+            self.iso_frag_minus_c13[2],
+            self.iso_frag_minus_c13[3],
+            self.iso_frag_minus_c13[4],
+            self.iso_frag_minus_c13[5],
+            self.iso_frag_minus_c13_sum,
+        ]
+    }
+}

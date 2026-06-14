@@ -47,6 +47,24 @@ pub const FEATURE_NAMES: &[&str] = &[
     "num_over_50_top6_idf",
     "mobility_observed",
     "delta_mobility",
+    "spectral_entropy_similarity",
+    "weighted_spectral_entropy_similarity",
+    "spectral_angle",
+    "matched_frag_fraction",
+    "ms1_coelution_base",
+    "ms1_coelution_045",
+    "ms1_coelution_02",
+    "iso_coelution_c13_1",
+    "iso_coelution_c13_2",
+    "iso_coelution_c13_3",
+    "iso_frag_plus_c13_sum",
+    "iso_frag_minus_c13_0",
+    "iso_frag_minus_c13_1",
+    "iso_frag_minus_c13_2",
+    "iso_frag_minus_c13_3",
+    "iso_frag_minus_c13_4",
+    "iso_frag_minus_c13_5",
+    "iso_frag_minus_c13_sum",
 ];
 
 #[derive(Debug, Clone)]
@@ -98,6 +116,25 @@ pub struct CandidateFeature {
     pub mobility_observed: f32,
     /// Observed minus predicted ion mobility (1/K0). 0.0 if no IM/library mobility.
     pub delta_mobility: f32,
+    pub spectral_entropy_similarity: f32,
+    pub weighted_spectral_entropy_similarity: f32,
+    pub spectral_angle: f32,
+    pub matched_frag_fraction: f32,
+    // MS1 + isotopologue co-elution panel (A1; DIA-NN 2020 Suppl Note 1).
+    pub ms1_coelution_base: f32,
+    pub ms1_coelution_045: f32,
+    pub ms1_coelution_02: f32,
+    pub iso_coelution_c13_1: f32,
+    pub iso_coelution_c13_2: f32,
+    pub iso_coelution_c13_3: f32,
+    pub iso_frag_plus_c13_sum: f32,
+    pub iso_frag_minus_c13_0: f32,
+    pub iso_frag_minus_c13_1: f32,
+    pub iso_frag_minus_c13_2: f32,
+    pub iso_frag_minus_c13_3: f32,
+    pub iso_frag_minus_c13_4: f32,
+    pub iso_frag_minus_c13_5: f32,
+    pub iso_frag_minus_c13_sum: f32,
 }
 
 impl CandidateFeature {
@@ -148,6 +185,24 @@ impl CandidateFeature {
         num_over_50_top6_idf: f32,
         mobility_observed: f32,
         delta_mobility: f32,
+        spectral_entropy_similarity: f32,
+        weighted_spectral_entropy_similarity: f32,
+        spectral_angle: f32,
+        matched_frag_fraction: f32,
+        ms1_coelution_base: f32,
+        ms1_coelution_045: f32,
+        ms1_coelution_02: f32,
+        iso_coelution_c13_1: f32,
+        iso_coelution_c13_2: f32,
+        iso_coelution_c13_3: f32,
+        iso_frag_plus_c13_sum: f32,
+        iso_frag_minus_c13_0: f32,
+        iso_frag_minus_c13_1: f32,
+        iso_frag_minus_c13_2: f32,
+        iso_frag_minus_c13_3: f32,
+        iso_frag_minus_c13_4: f32,
+        iso_frag_minus_c13_5: f32,
+        iso_frag_minus_c13_sum: f32,
     ) -> Self {
         Self {
             precursor_idx,
@@ -195,6 +250,24 @@ impl CandidateFeature {
             num_over_50_top6_idf,
             mobility_observed,
             delta_mobility,
+            spectral_entropy_similarity,
+            weighted_spectral_entropy_similarity,
+            spectral_angle,
+            matched_frag_fraction,
+            ms1_coelution_base,
+            ms1_coelution_045,
+            ms1_coelution_02,
+            iso_coelution_c13_1,
+            iso_coelution_c13_2,
+            iso_coelution_c13_3,
+            iso_frag_plus_c13_sum,
+            iso_frag_minus_c13_0,
+            iso_frag_minus_c13_1,
+            iso_frag_minus_c13_2,
+            iso_frag_minus_c13_3,
+            iso_frag_minus_c13_4,
+            iso_frag_minus_c13_5,
+            iso_frag_minus_c13_sum,
         }
     }
 }
@@ -275,6 +348,24 @@ impl CandidateFeatureCollection {
         let mut num_over_50_top6_idf = Array1::<f32>::zeros(n);
         let mut mobility_observed = Array1::<f32>::zeros(n);
         let mut delta_mobility = Array1::<f32>::zeros(n);
+        let mut spectral_entropy_similarity = Array1::<f32>::zeros(n);
+        let mut weighted_spectral_entropy_similarity = Array1::<f32>::zeros(n);
+        let mut spectral_angle = Array1::<f32>::zeros(n);
+        let mut matched_frag_fraction = Array1::<f32>::zeros(n);
+        let mut ms1_coelution_base = Array1::<f32>::zeros(n);
+        let mut ms1_coelution_045 = Array1::<f32>::zeros(n);
+        let mut ms1_coelution_02 = Array1::<f32>::zeros(n);
+        let mut iso_coelution_c13_1 = Array1::<f32>::zeros(n);
+        let mut iso_coelution_c13_2 = Array1::<f32>::zeros(n);
+        let mut iso_coelution_c13_3 = Array1::<f32>::zeros(n);
+        let mut iso_frag_plus_c13_sum = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_0 = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_1 = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_2 = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_3 = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_4 = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_5 = Array1::<f32>::zeros(n);
+        let mut iso_frag_minus_c13_sum = Array1::<f32>::zeros(n);
 
         for (i, feature) in self.features.iter().enumerate() {
             precursor_idxs[i] = feature.precursor_idx as u64;
@@ -322,6 +413,24 @@ impl CandidateFeatureCollection {
             num_over_50_top6_idf[i] = feature.num_over_50_top6_idf;
             mobility_observed[i] = feature.mobility_observed;
             delta_mobility[i] = feature.delta_mobility;
+            spectral_entropy_similarity[i] = feature.spectral_entropy_similarity;
+            weighted_spectral_entropy_similarity[i] = feature.weighted_spectral_entropy_similarity;
+            spectral_angle[i] = feature.spectral_angle;
+            matched_frag_fraction[i] = feature.matched_frag_fraction;
+            ms1_coelution_base[i] = feature.ms1_coelution_base;
+            ms1_coelution_045[i] = feature.ms1_coelution_045;
+            ms1_coelution_02[i] = feature.ms1_coelution_02;
+            iso_coelution_c13_1[i] = feature.iso_coelution_c13_1;
+            iso_coelution_c13_2[i] = feature.iso_coelution_c13_2;
+            iso_coelution_c13_3[i] = feature.iso_coelution_c13_3;
+            iso_frag_plus_c13_sum[i] = feature.iso_frag_plus_c13_sum;
+            iso_frag_minus_c13_0[i] = feature.iso_frag_minus_c13_0;
+            iso_frag_minus_c13_1[i] = feature.iso_frag_minus_c13_1;
+            iso_frag_minus_c13_2[i] = feature.iso_frag_minus_c13_2;
+            iso_frag_minus_c13_3[i] = feature.iso_frag_minus_c13_3;
+            iso_frag_minus_c13_4[i] = feature.iso_frag_minus_c13_4;
+            iso_frag_minus_c13_5[i] = feature.iso_frag_minus_c13_5;
+            iso_frag_minus_c13_sum[i] = feature.iso_frag_minus_c13_sum;
         }
 
         let dict = PyDict::new(py);
@@ -421,6 +530,24 @@ impl CandidateFeatureCollection {
         )?;
         dict.set_item("mobility_observed", mobility_observed.into_pyarray(py))?;
         dict.set_item("delta_mobility", delta_mobility.into_pyarray(py))?;
+        dict.set_item("spectral_entropy_similarity", spectral_entropy_similarity.into_pyarray(py))?;
+        dict.set_item("weighted_spectral_entropy_similarity", weighted_spectral_entropy_similarity.into_pyarray(py))?;
+        dict.set_item("spectral_angle", spectral_angle.into_pyarray(py))?;
+        dict.set_item("matched_frag_fraction", matched_frag_fraction.into_pyarray(py))?;
+        dict.set_item("ms1_coelution_base", ms1_coelution_base.into_pyarray(py))?;
+        dict.set_item("ms1_coelution_045", ms1_coelution_045.into_pyarray(py))?;
+        dict.set_item("ms1_coelution_02", ms1_coelution_02.into_pyarray(py))?;
+        dict.set_item("iso_coelution_c13_1", iso_coelution_c13_1.into_pyarray(py))?;
+        dict.set_item("iso_coelution_c13_2", iso_coelution_c13_2.into_pyarray(py))?;
+        dict.set_item("iso_coelution_c13_3", iso_coelution_c13_3.into_pyarray(py))?;
+        dict.set_item("iso_frag_plus_c13_sum", iso_frag_plus_c13_sum.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_0", iso_frag_minus_c13_0.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_1", iso_frag_minus_c13_1.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_2", iso_frag_minus_c13_2.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_3", iso_frag_minus_c13_3.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_4", iso_frag_minus_c13_4.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_5", iso_frag_minus_c13_5.into_pyarray(py))?;
+        dict.set_item("iso_frag_minus_c13_sum", iso_frag_minus_c13_sum.into_pyarray(py))?;
 
         Ok(dict.into())
     }

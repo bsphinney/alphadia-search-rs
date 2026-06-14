@@ -5,13 +5,15 @@ use std::time::Instant;
 use crate::candidate::{
     Candidate, CandidateCollection, CandidateFeature, CandidateFeatureCollection,
 };
-use crate::constants::FragmentType;
-use crate::dense_xic_observation::DenseXICMZObservation;
+use crate::constants::{FragmentType, C13_C12};
+use crate::dense_xic_observation::{DenseXICMZObservation, DenseXICObservation};
 use crate::dia_data::DIAData;
 use crate::peak_group_scoring::utils::{
     calculate_correlation_safe, calculate_dot_product, calculate_fwhm_rt, calculate_hyperscore,
+    calculate_matched_frag_fraction, calculate_spectral_angle, calculate_spectral_entropy_similarity,
+    calculate_weighted_spectral_entropy_similarity,
     calculate_hyperscore_inverse_mass_error, calculate_longest_ion_series, correlation_axis_0,
-    filter_non_zero, intensity_ion_series, median_axis_0, normalize_profiles,
+    filter_non_zero, intensity_ion_series, median_axis_0, normalize_profiles, Ms1IsotopeFeatures,
 };
 use crate::precursor::Precursor;
 use crate::traits::DIADataTrait;
@@ -323,6 +325,135 @@ impl PeakGroupScoring {
         let num_over_0_top6_idf = count_values_above(&correlations, 0.0, Some(&mask_top6_idf));
         let num_over_50_top6_idf = count_values_above(&correlations, 0.50, Some(&mask_top6_idf));
 
+        // ---- MS2 similarity panel (predicted-vs-observed fragment intensities) ----
+        // obs = summed observed XIC intensity per library fragment; lib = library
+        // predicted intensity. Index-aligned; obs==0 => unmatched fragment.
+        let obs_ints = observation_intensities.as_slice().unwrap();
+        let lib_ints: &[f32] = &precursor.fragment_intensity;
+        let spectral_entropy_similarity =
+            calculate_spectral_entropy_similarity(obs_ints, lib_ints);
+        let weighted_spectral_entropy_similarity =
+            calculate_weighted_spectral_entropy_similarity(obs_ints, lib_ints);
+        let spectral_angle = calculate_spectral_angle(obs_ints, lib_ints);
+        let matched_frag_fraction = calculate_matched_frag_fraction(obs_ints, lib_ints);
+
+        // ---- MS1 + isotopologue co-elution panel (DIA-NN 2020 Suppl Note 1) ----
+        // The "best"/reference smoothed elution profile is `median_profile_filtered`
+        // (the same smoothed reference the existing MS2 co-elution features use —
+        // one definition, per the engine's existing convention). All 14 features
+        // default to 0.0; they stay 0.0 when MS1 is absent (old caches) — a no-op
+        // for the NN. The MS1 store indexes survey peaks by m/z; we extract the
+        // precursor + isotope chromatograms over the SAME RT(cycle) x IM(scan)
+        // window as the fragments, so the correlations are directly comparable.
+        let mut ms1iso = Ms1IsotopeFeatures::default();
+        if let Some(ms1) = dia_data.ms1() {
+            let ref_profile = median_profile_filtered.as_slice();
+            let base_tol = self.params.mass_tolerance;
+            let p_mz = precursor.mz;
+
+            // (1) MS1 precursor co-elution at base / 0.45*base / 0.2*base mass acc.
+            let extract_ms1 = |tol: f32, mz: f32| -> Vec<f32> {
+                ms1.extract_xic(
+                    mz,
+                    cycle_start_idx,
+                    cycle_stop_idx,
+                    scan_start,
+                    scan_stop,
+                    tol,
+                )
+                .to_vec()
+            };
+            let xic_base = extract_ms1(base_tol, p_mz);
+            ms1iso.ms1_coelution_base =
+                calculate_correlation_safe(ref_profile, &xic_base);
+            ms1iso.ms1_coelution_045 =
+                calculate_correlation_safe(ref_profile, &extract_ms1(base_tol * 0.45, p_mz));
+            ms1iso.ms1_coelution_02 =
+                calculate_correlation_safe(ref_profile, &extract_ms1(base_tol * 0.2, p_mz));
+
+            // (2) Isotopologue MS1 co-elution: precursor + 1/2/3 C13. Needs charge
+            // for the m/z spacing C13_C12 / z. Skip (leave 0.0) if charge unknown.
+            if precursor.charge > 0 {
+                let z = precursor.charge as f32;
+                let step = C13_C12 / z;
+                ms1iso.iso_coelution_c13_1 =
+                    calculate_correlation_safe(ref_profile, &extract_ms1(base_tol, p_mz + step));
+                ms1iso.iso_coelution_c13_2 = calculate_correlation_safe(
+                    ref_profile,
+                    &extract_ms1(base_tol, p_mz + 2.0 * step),
+                );
+                ms1iso.iso_coelution_c13_3 = calculate_correlation_safe(
+                    ref_profile,
+                    &extract_ms1(base_tol, p_mz + 3.0 * step),
+                );
+            }
+
+            // (3) Fragment-level isotopologue features. For each fragment, the +1
+            // and -1 C13 shifts are C13_C12 / fragment_charge (library fragments
+            // are z=1 here; use the per-fragment charge, default 1). Extract the
+            // shifted-fragment MS2 XICs with the same IM-windowed machinery used
+            // for the matched fragments, normalize identically, correlate with the
+            // reference. Top-6 by library intensity, ordered by descending lib int.
+            let n_frag = precursor.fragment_mz.len();
+            if n_frag > 0 {
+                // build +shift and -shift fragment m/z arrays
+                let mut fmz_plus = Vec::with_capacity(n_frag);
+                let mut fmz_minus = Vec::with_capacity(n_frag);
+                for i in 0..n_frag {
+                    let fz = if i < precursor.fragment_charge.len() && precursor.fragment_charge[i] > 0
+                    {
+                        precursor.fragment_charge[i] as f32
+                    } else {
+                        1.0
+                    };
+                    let fstep = C13_C12 / fz;
+                    fmz_plus.push(precursor.fragment_mz[i] + fstep);
+                    fmz_minus.push(precursor.fragment_mz[i] - fstep);
+                }
+
+                let corr_shifted = |fmz_shifted: &[f32]| -> Vec<f32> {
+                    let obs = DenseXICObservation::new(
+                        dia_data,
+                        p_mz,
+                        cycle_start_idx,
+                        cycle_stop_idx,
+                        scan_start,
+                        scan_stop,
+                        base_tol,
+                        fmz_shifted,
+                    );
+                    let norm = normalize_profiles(&obs.dense_xic, 1);
+                    correlation_axis_0(ref_profile, &norm)
+                };
+                let corr_plus = corr_shifted(&fmz_plus);
+                let corr_minus = corr_shifted(&fmz_minus);
+
+                // rank fragments by library intensity (descending); take top 6.
+                let mut order: Vec<usize> = (0..n_frag).collect();
+                order.sort_by(|&a, &b| {
+                    precursor.fragment_intensity[b]
+                        .partial_cmp(&precursor.fragment_intensity[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let top6: Vec<usize> = order.into_iter().take(6).collect();
+
+                // +1 C13 fragment-isotopologue sum over top 6
+                ms1iso.iso_frag_plus_c13_sum =
+                    top6.iter().map(|&i| corr_plus[i]).sum();
+
+                // anti-features: per-fragment -(C13) corr for top 6 (+ their sum)
+                let mut anti_sum = 0.0;
+                for (k, &i) in top6.iter().enumerate() {
+                    if k < 6 {
+                        ms1iso.iso_frag_minus_c13[k] = corr_minus[i];
+                    }
+                    anti_sum += corr_minus[i];
+                }
+                ms1iso.iso_frag_minus_c13_sum = anti_sum;
+            }
+        }
+        let ms1_arr = ms1iso.as_array();
+
         // Create and return candidate feature
         Some(CandidateFeature::new(
             candidate.precursor_idx,
@@ -370,6 +501,24 @@ impl PeakGroupScoring {
             num_over_50_top6_idf as f32,
             mobility_observed,
             delta_mobility,
+            spectral_entropy_similarity,
+            weighted_spectral_entropy_similarity,
+            spectral_angle,
+            matched_frag_fraction,
+            ms1_arr[0],
+            ms1_arr[1],
+            ms1_arr[2],
+            ms1_arr[3],
+            ms1_arr[4],
+            ms1_arr[5],
+            ms1_arr[6],
+            ms1_arr[7],
+            ms1_arr[8],
+            ms1_arr[9],
+            ms1_arr[10],
+            ms1_arr[11],
+            ms1_arr[12],
+            ms1_arr[13],
         ))
     }
 }

@@ -38,6 +38,17 @@ pub trait DIADataTrait {
     fn mobility_of_scan(&self, _scan_idx: usize) -> f32 {
         0.0
     }
+
+    /// Whether MS1 survey-frame signal is available (A1: MS1/isotope features).
+    /// Defaults to false; backends with an MS1 store override this.
+    fn has_ms1(&self) -> bool {
+        false
+    }
+
+    /// Access the MS1 survey-frame peak store, if present. Default `None`.
+    fn ms1(&self) -> Option<&crate::ms1_observation::Ms1Observation> {
+        None
+    }
 }
 
 /// Trait for quadrupole observation types that support XIC slice filling

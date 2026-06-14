@@ -12,6 +12,7 @@ pub mod dia_data_builder;
 pub mod idf;
 mod kernel;
 pub mod im_observation;
+pub mod ms1_observation;
 mod mz_index;
 pub mod peak_group_quantification;
 pub mod peak_group_scoring;
