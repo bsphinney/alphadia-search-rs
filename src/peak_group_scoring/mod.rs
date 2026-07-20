@@ -13,16 +13,25 @@ use crate::peak_group_scoring::utils::{
     calculate_matched_frag_fraction, calculate_spectral_angle, calculate_spectral_entropy_similarity,
     calculate_weighted_spectral_entropy_similarity,
     calculate_hyperscore_inverse_mass_error, calculate_longest_ion_series, correlation_axis_0,
-    filter_non_zero, intensity_ion_series, median_axis_0, normalize_profiles, Ms1IsotopeFeatures,
+    filter_non_zero, intensity_ion_series, iso_pattern_metrics, median_axis_0, normalize_profiles,
+    theoretical_isotope_envelope, Ms1IsotopeFeatures,
 };
 use crate::precursor::Precursor;
 use crate::traits::DIADataTrait;
 use crate::utils::{
     calculate_fragment_mz_and_errors, calculate_median, calculate_std,
-    calculate_weighted_mean_absolute_error, count_values_above, create_ranked_mask,
+    calculate_weighted_mean_absolute_error, calculate_weighted_mean_signed_error,
+    count_values_above, create_ranked_mask,
 };
 use crate::SpecLibFlat;
 use numpy::ndarray::Axis;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Global counters for the fragment-interference co-elution filter (fix #1).
+// Reset at the start of each score() call; reported at the end. Relaxed is fine
+// (monotone increment, printed after the rayon join = happens-before).
+static FRAG_MATCHED: AtomicU64 = AtomicU64::new(0);
+static FRAG_EXCLUDED: AtomicU64 = AtomicU64::new(0);
 
 pub mod parameters;
 pub mod tests;
@@ -62,6 +71,22 @@ impl PeakGroupScoring {
     ) -> CandidateFeatureCollection {
         let start_time = Instant::now();
 
+        // Reset the fragment-interference counters for this pass.
+        FRAG_MATCHED.store(0, Ordering::Relaxed);
+        FRAG_EXCLUDED.store(0, Ordering::Relaxed);
+
+        // Read the interference-cleaning env config ONCE per pass (not per candidate —
+        // there are tens of millions of candidates, and env::var is a syscall+alloc).
+        let coelut_thresh: f32 = std::env::var("COELUT_THRESH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1.0);
+        let ms1_clean: bool = std::env::var("MS1_CLEAN").ok().as_deref() == Some("1");
+        let ms1_clean_pow: f32 = std::env::var("MS1_CLEAN_POW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+
         // Parallel iteration over candidates to score each one
         let scored_candidates: Vec<CandidateFeature> = candidates
             .par_iter()
@@ -73,9 +98,15 @@ impl PeakGroupScoring {
                     true, // Filter Y1 ions by default
                     self.params.top_k_fragments,
                 ) {
-                    Some(precursor) => {
-                        self.score_candidate_generic(dia_data, lib, &precursor, candidate)
-                    }
+                    Some(precursor) => self.score_candidate_generic(
+                        dia_data,
+                        lib,
+                        &precursor,
+                        candidate,
+                        coelut_thresh,
+                        ms1_clean,
+                        ms1_clean_pow,
+                    ),
                     None => {
                         eprintln!(
                             "Warning: Candidate precursor_idx {} not found in library. Skipping.",
@@ -100,6 +131,19 @@ impl PeakGroupScoring {
             candidates_per_second
         );
 
+        // Fragment-interference filter report (fix #1). % of matched product ions
+        // excluded for non-co-elution vs the peptide's consensus elution profile.
+        let fm = FRAG_MATCHED.load(Ordering::Relaxed);
+        let fe = FRAG_EXCLUDED.load(Ordering::Relaxed);
+        if fe > 0 {
+            println!(
+                "FRAG_INTERF: excluded {}/{} matched fragments ({:.1}%) below co-elution threshold",
+                fe,
+                fm,
+                100.0 * fe as f32 / fm.max(1) as f32
+            );
+        }
+
         feature_collection
     }
 
@@ -110,6 +154,9 @@ impl PeakGroupScoring {
         lib: &SpecLibFlat,
         precursor: &Precursor,
         candidate: &Candidate,
+        coelut_thresh: f32,
+        ms1_clean: bool,
+        ms1_clean_pow: f32,
     ) -> Option<CandidateFeature> {
         // Scoring implementation for individual candidate will be added here
         // For now, return the original score
@@ -233,9 +280,39 @@ impl PeakGroupScoring {
         let num_fragments = precursor.fragment_mz.len();
         let num_scans = cycle_stop_idx - cycle_start_idx;
 
+        // ---- FRAGMENT INTERFERENCE REMOVAL (fix #1): per-fragment co-elution filter ----
+        // `correlations[i]` (computed above) = corr(consensus elution profile
+        // `median_profile_filtered`, fragment_i XIC). Product ions whose XIC does not
+        // co-elute with the consensus are interference-contaminated (a different peptide's
+        // ion falling in the same wide DIA window). Zero their observed intensity BEFORE the
+        // quality features (hyperscore, spectral angle/entropy, matched-fraction, ion series,
+        // quant) so the scorer sees only co-eluting signal — the Spectronaut recipe (~41% of
+        // fragments excluded). coelut_thresh (from score_generic) < 0 (default) = OFF.
+        let obs_raw = observation_intensities.as_slice().unwrap();
+        let mut obs_clean: Vec<f32> = obs_raw.to_vec();
+        if coelut_thresh >= 0.0 {
+            let mut n_match = 0u64;
+            let mut n_excl = 0u64;
+            for i in 0..obs_clean.len() {
+                if obs_clean[i] > 0.0 {
+                    n_match += 1;
+                    let c = if i < correlations.len() {
+                        correlations[i]
+                    } else {
+                        1.0
+                    };
+                    if c < coelut_thresh {
+                        obs_clean[i] = 0.0;
+                        n_excl += 1;
+                    }
+                }
+            }
+            FRAG_MATCHED.fetch_add(n_match, Ordering::Relaxed);
+            FRAG_EXCLUDED.fetch_add(n_excl, Ordering::Relaxed);
+        }
         let matched_mask_intensity: Vec<bool> =
-            observation_intensities.iter().map(|&x| x > 0.0).collect();
-        let observation_intensities_slice = observation_intensities.as_slice().unwrap();
+            obs_clean.iter().map(|&x| x > 0.0).collect();
+        let observation_intensities_slice = obs_clean.as_slice();
 
         let hyperscore_intensity_observation = calculate_hyperscore(
             &precursor.fragment_type,
@@ -269,11 +346,19 @@ impl PeakGroupScoring {
             &precursor.fragment_intensity,
         );
 
+        // C6 fix: also compute the SIGNED weighted mean mass error (no .abs()) for the
+        // L2 recalibration polynomial fit in extract_feats.py. The absolute version above
+        // is kept unchanged because the classifier still uses it.
+        let weighted_mass_error_signed = calculate_weighted_mean_signed_error(
+            &fragment_mass_errors,
+            &precursor.fragment_intensity,
+        );
+
         // Calculate hyperscore with inverse mass error weighting
         // Use observed intensities (sum across cycles) and exclude zero intensity fragments
         let hyperscore_inverse_mass_error = calculate_hyperscore_inverse_mass_error(
             &precursor.fragment_type,
-            observation_intensities.as_slice().unwrap(),
+            observation_intensities_slice,
             &matched_mask_intensity,
             &fragment_mass_errors,
         );
@@ -285,14 +370,14 @@ impl PeakGroupScoring {
         // Calculate intensity scores for b and y series
         let intensity_b_raw = intensity_ion_series(
             &precursor.fragment_type,
-            observation_intensities.as_slice().unwrap(),
+            observation_intensities_slice,
             &matched_mask_intensity,
             FragmentType::B,
         );
 
         let intensity_y_raw = intensity_ion_series(
             &precursor.fragment_type,
-            observation_intensities.as_slice().unwrap(),
+            observation_intensities_slice,
             &matched_mask_intensity,
             FragmentType::Y,
         );
@@ -314,7 +399,7 @@ impl PeakGroupScoring {
 
         let idf_xic_dot_product = calculate_dot_product(&idf_values, &correlations);
         let idf_intensity_dot_product =
-            calculate_dot_product(&idf_values, observation_intensities.as_slice().unwrap());
+            calculate_dot_product(&idf_values, observation_intensities_slice);
 
         let log_idf_intensity_dot_product = (idf_intensity_dot_product + EPSILON).log10();
 
@@ -328,7 +413,7 @@ impl PeakGroupScoring {
         // ---- MS2 similarity panel (predicted-vs-observed fragment intensities) ----
         // obs = summed observed XIC intensity per library fragment; lib = library
         // predicted intensity. Index-aligned; obs==0 => unmatched fragment.
-        let obs_ints = observation_intensities.as_slice().unwrap();
+        let obs_ints = observation_intensities_slice;
         let lib_ints: &[f32] = &precursor.fragment_intensity;
         let spectral_entropy_similarity =
             calculate_spectral_entropy_similarity(obs_ints, lib_ints);
@@ -348,7 +433,7 @@ impl PeakGroupScoring {
         let mut ms1iso = Ms1IsotopeFeatures::default();
         if let Some(ms1) = dia_data.ms1() {
             let ref_profile = median_profile_filtered.as_slice();
-            let base_tol = self.params.mass_tolerance;
+            let base_tol = self.params.mass_tolerance.max(30.0f32);  // MS1 needs wider tol than MS2 fragments (miscalibration)
             let p_mz = precursor.mz;
 
             // (1) MS1 precursor co-elution at base / 0.45*base / 0.2*base mass acc.
@@ -363,29 +448,41 @@ impl PeakGroupScoring {
                 )
                 .to_vec()
             };
+            // APEX-CENTERED MS1 co-elution (#45 fix): correlate ref vs MS1 only over a narrow
+            // window (+-APEX_HALF cycles) around the ref profile's apex, where the true co-elution
+            // lives. The full candidate window drags in off-peak noise/interference that collapses
+            // the correlation (validated offline: full-window median r ~0.16 -> apex-centered ~0.60
+            // on underscored dogs; our MS1 XIC matches DIA-NN's at r~0.64, so the signal is real).
+            const APEX_HALF: usize = 8;
+            let n_ref = ref_profile.len();
+            let apex = ref_profile
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let alo = apex.saturating_sub(APEX_HALF);
+            let ahi = (apex + APEX_HALF + 1).min(n_ref);
+            let corr_apex = |xic: &[f32]| -> f32 {
+                if ahi > alo && xic.len() == n_ref {
+                    calculate_correlation_safe(&ref_profile[alo..ahi], &xic[alo..ahi])
+                } else {
+                    calculate_correlation_safe(ref_profile, xic)
+                }
+            };
             let xic_base = extract_ms1(base_tol, p_mz);
-            ms1iso.ms1_coelution_base =
-                calculate_correlation_safe(ref_profile, &xic_base);
-            ms1iso.ms1_coelution_045 =
-                calculate_correlation_safe(ref_profile, &extract_ms1(base_tol * 0.45, p_mz));
-            ms1iso.ms1_coelution_02 =
-                calculate_correlation_safe(ref_profile, &extract_ms1(base_tol * 0.2, p_mz));
+            ms1iso.ms1_coelution_base = corr_apex(&xic_base);
+            ms1iso.ms1_coelution_045 = corr_apex(&extract_ms1(base_tol * 0.45, p_mz));
+            ms1iso.ms1_coelution_02 = corr_apex(&extract_ms1(base_tol * 0.2, p_mz));
 
             // (2) Isotopologue MS1 co-elution: precursor + 1/2/3 C13. Needs charge
             // for the m/z spacing C13_C12 / z. Skip (leave 0.0) if charge unknown.
             if precursor.charge > 0 {
                 let z = precursor.charge as f32;
                 let step = C13_C12 / z;
-                ms1iso.iso_coelution_c13_1 =
-                    calculate_correlation_safe(ref_profile, &extract_ms1(base_tol, p_mz + step));
-                ms1iso.iso_coelution_c13_2 = calculate_correlation_safe(
-                    ref_profile,
-                    &extract_ms1(base_tol, p_mz + 2.0 * step),
-                );
-                ms1iso.iso_coelution_c13_3 = calculate_correlation_safe(
-                    ref_profile,
-                    &extract_ms1(base_tol, p_mz + 3.0 * step),
-                );
+                ms1iso.iso_coelution_c13_1 = corr_apex(&extract_ms1(base_tol, p_mz + step));
+                ms1iso.iso_coelution_c13_2 = corr_apex(&extract_ms1(base_tol, p_mz + 2.0 * step));
+                ms1iso.iso_coelution_c13_3 = corr_apex(&extract_ms1(base_tol, p_mz + 3.0 * step));
             }
 
             // (3) Fragment-level isotopologue features. For each fragment, the +1
@@ -451,11 +548,73 @@ impl PeakGroupScoring {
                 }
                 ms1iso.iso_frag_minus_c13_sum = anti_sum;
             }
+
+            // (4) Isotope-envelope-RATIO panel (A2; AlphaDIA isotope_intensity_correlation).
+            // OBSERVED envelope obs[0..3]: sum each per-isotope MS1 XIC over the SAME
+            // RT(cycle) x IM(scan) window (the IM-window extraction is our timsTOF edge)
+            // at base mass tol. obs[0] is the precursor (monoisotopic) channel; obs[k]
+            // is p_mz + k*C13_C12/charge. Zero-fill a channel with no signal (its XIC
+            // sum is just 0.0). THEORETICAL envelope theo[0..3] from the averagine model
+            // (Senko 1995; see theoretical_isotope_envelope). Then 3 ratio/shape metrics.
+            if precursor.charge > 0 {
+                let z = precursor.charge as f32;
+                let step = C13_C12 / z;
+                let mut obs = [0.0f32; 4];
+                for (k, obs_k) in obs.iter_mut().enumerate() {
+                    let xic = extract_ms1(base_tol, p_mz + (k as f32) * step);
+                    *obs_k = xic.iter().sum();
+                }
+                let theo = theoretical_isotope_envelope(precursor.naa, precursor.charge, p_mz);
+                let (corr, sa, residual) = iso_pattern_metrics(&theo, &obs);
+                ms1iso.iso_pattern_corr = corr;
+                ms1iso.iso_pattern_sa = sa;
+                ms1iso.iso_m1_over_m_residual = residual;
+            }
+
+            // (5) MS1 signal-MAGNITUDE panel (#51). Absolute abundance terms the
+            // linear rollup lacked: integrated area + apex of the monoisotope XIC,
+            // and total signal over the M/M+1/M+2 envelope. xic_base is the base-tol
+            // monoisotope precursor XIC extracted above (L376).
+            ms1iso.ms1_area = xic_base.iter().sum();
+            ms1iso.ms1_apex = xic_base.iter().cloned().fold(0.0f32, f32::max);
+            ms1iso.ms1_total = if precursor.charge > 0 {
+                let z = precursor.charge as f32;
+                let step = C13_C12 / z;
+                (0..3)
+                    .map(|k| extract_ms1(base_tol, p_mz + (k as f32) * step).iter().sum::<f32>())
+                    .sum()
+            } else {
+                ms1iso.ms1_area
+            };
+
+            // ---- MS1 INTERFERENCE CLEANING (fix #2) ----
+            // ms1_area is the engine's DOMINANT scoring feature, but the wide dia-PASEF
+            // isolation window lets other co-eluting precursors contaminate the MS1 signal
+            // (Spectronaut flags MS1 interference on ~70% of precursors). A contaminated
+            // MS1 XIC (a) does NOT co-elute with this peptide's fragment consensus and/or
+            // (b) does NOT match the theoretical isotope envelope. Downweight the MS1
+            // magnitude features by that quality so chimeric signal can't inflate a wrong
+            // candidate's score; a clean precursor (co-elution~1, iso-match~1) is unchanged.
+            // Env MS1_CLEAN=1 enables; unset = raw (byte-identical). MS1_CLEAN_POW (default 1)
+            // controls gate sharpness. The gate is driven by ms1_coelution_base — the
+            // apex-centered correlation of the MS1 monoisotope XIC with the fragment
+            // consensus profile — which cleanly separates real precursors (confident-dog
+            // median ~0.84) from contaminated/wrong MS1 (decoy/junk median ~0.05). (The
+            // theoretical-isotope-pattern SA is ~0 for everyone on this data, so it is NOT
+            // used — multiplying by it would zero out ms1_area for real peptides too.)
+            if ms1_clean {
+                let pw: f32 = ms1_clean_pow;
+                let ce = ms1iso.ms1_coelution_base.clamp(0.0, 1.0);
+                let gate = ce.powf(pw);
+                ms1iso.ms1_area *= gate;
+                ms1iso.ms1_apex *= gate;
+                ms1iso.ms1_total *= gate;
+            }
         }
         let ms1_arr = ms1iso.as_array();
 
         // Create and return candidate feature
-        Some(CandidateFeature::new(
+        let mut __feat = CandidateFeature::new(
             candidate.precursor_idx,
             candidate.rank,
             candidate.score,
@@ -487,6 +646,7 @@ impl PeakGroupScoring {
             longest_y_series as f32,
             precursor.naa as f32,
             weighted_mass_error,
+            weighted_mass_error_signed,
             log10_b_ion_intensity,
             log10_y_ion_intensity,
             fwhm_rt,
@@ -519,6 +679,16 @@ impl PeakGroupScoring {
             ms1_arr[11],
             ms1_arr[12],
             ms1_arr[13],
-        ))
+            ms1_arr[14],
+            ms1_arr[15],
+            ms1_arr[16],
+            ms1_arr[17],
+            ms1_arr[18],
+            ms1_arr[19],
+        );
+        // empirical-refinement: carry the observed per-fragment intensities (aligned to library
+        // fragment order) out of scoring so the refined-library builder can rebuild observed spectra.
+        __feat.observed_frag_intensities = observation_intensities.to_vec();
+        Some(__feat)
     }
 }
