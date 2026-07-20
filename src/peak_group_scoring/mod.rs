@@ -86,6 +86,12 @@ impl PeakGroupScoring {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0);
+        // COELUT_APEX=1: base the fragment interference filter on APEX-CENTERED per-fragment
+        // co-elution (correlate each fragment XIC to the consensus over +-8 cycles around the
+        // consensus apex) instead of the full-window correlation. Full-window r is ~0.16 even
+        // for real fragments (engine note), so a full-window COELUT_THRESH over-excludes; apex-
+        // centering recovers the true co-elution (~0.6), the same trick the MS1 feature uses.
+        let coelut_apex: bool = std::env::var("COELUT_APEX").ok().as_deref() == Some("1");
 
         // Parallel iteration over candidates to score each one
         let scored_candidates: Vec<CandidateFeature> = candidates
@@ -106,6 +112,7 @@ impl PeakGroupScoring {
                         coelut_thresh,
                         ms1_clean,
                         ms1_clean_pow,
+                        coelut_apex,
                     ),
                     None => {
                         eprintln!(
@@ -157,6 +164,7 @@ impl PeakGroupScoring {
         coelut_thresh: f32,
         ms1_clean: bool,
         ms1_clean_pow: f32,
+        coelut_apex: bool,
     ) -> Option<CandidateFeature> {
         // Scoring implementation for individual candidate will be added here
         // For now, return the original score
@@ -292,14 +300,49 @@ impl PeakGroupScoring {
         // Only allocate a cleaned copy when the filter is active (avoids a per-candidate
         // Vec allocation across tens of millions of candidates when the filter is OFF).
         let obs_clean_opt: Option<Vec<f32>> = if coelut_thresh >= 0.0 {
+            // Choose the per-fragment co-elution score: full-window `correlations` (default)
+            // or apex-centered (COELUT_APEX=1) — correlate each fragment XIC to the consensus
+            // only over +-8 cycles around the consensus apex, where the true co-elution lives.
+            let frag_score: Vec<f32> = if coelut_apex {
+                let refv = median_profile_filtered.as_slice();
+                let n_ref = refv.len();
+                let apex = refv
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                const AH: usize = 8;
+                let alo = apex.saturating_sub(AH);
+                let ahi = (apex + AH + 1).min(n_ref);
+                (0..normalized_xic.shape()[0])
+                    .map(|r| {
+                        let row = normalized_xic.row(r);
+                        match row.as_slice() {
+                            Some(rs) if ahi > alo && rs.len() == n_ref => {
+                                calculate_correlation_safe(&refv[alo..ahi], &rs[alo..ahi])
+                            }
+                            _ => {
+                                if r < correlations.len() {
+                                    correlations[r]
+                                } else {
+                                    1.0
+                                }
+                            }
+                        }
+                    })
+                    .collect()
+            } else {
+                correlations.clone()
+            };
             let mut v = obs_raw.to_vec();
             let mut n_match = 0u64;
             let mut n_excl = 0u64;
             for i in 0..v.len() {
                 if v[i] > 0.0 {
                     n_match += 1;
-                    let c = if i < correlations.len() {
-                        correlations[i]
+                    let c = if i < frag_score.len() {
+                        frag_score[i]
                     } else {
                         1.0
                     };
