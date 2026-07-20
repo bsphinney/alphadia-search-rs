@@ -289,12 +289,14 @@ impl PeakGroupScoring {
         // quant) so the scorer sees only co-eluting signal — the Spectronaut recipe (~41% of
         // fragments excluded). coelut_thresh (from score_generic) < 0 (default) = OFF.
         let obs_raw = observation_intensities.as_slice().unwrap();
-        let mut obs_clean: Vec<f32> = obs_raw.to_vec();
-        if coelut_thresh >= 0.0 {
+        // Only allocate a cleaned copy when the filter is active (avoids a per-candidate
+        // Vec allocation across tens of millions of candidates when the filter is OFF).
+        let obs_clean_opt: Option<Vec<f32>> = if coelut_thresh >= 0.0 {
+            let mut v = obs_raw.to_vec();
             let mut n_match = 0u64;
             let mut n_excl = 0u64;
-            for i in 0..obs_clean.len() {
-                if obs_clean[i] > 0.0 {
+            for i in 0..v.len() {
+                if v[i] > 0.0 {
                     n_match += 1;
                     let c = if i < correlations.len() {
                         correlations[i]
@@ -302,17 +304,21 @@ impl PeakGroupScoring {
                         1.0
                     };
                     if c < coelut_thresh {
-                        obs_clean[i] = 0.0;
+                        v[i] = 0.0;
                         n_excl += 1;
                     }
                 }
             }
             FRAG_MATCHED.fetch_add(n_match, Ordering::Relaxed);
             FRAG_EXCLUDED.fetch_add(n_excl, Ordering::Relaxed);
-        }
+            Some(v)
+        } else {
+            None
+        };
+        let observation_intensities_slice: &[f32] =
+            obs_clean_opt.as_deref().unwrap_or(obs_raw);
         let matched_mask_intensity: Vec<bool> =
-            obs_clean.iter().map(|&x| x > 0.0).collect();
-        let observation_intensities_slice = obs_clean.as_slice();
+            observation_intensities_slice.iter().map(|&x| x > 0.0).collect();
 
         let hyperscore_intensity_observation = calculate_hyperscore(
             &precursor.fragment_type,
