@@ -53,6 +53,37 @@ pub trait DIADataTrait {
 
 /// Trait for quadrupole observation types that support XIC slice filling
 pub trait QuadrupoleObservationTrait {
+    /// Cheap presence check for the fragment-presence pre-filter: does `mz` (+/- ppm)
+    /// have ANY signal in [cycle_start,cycle_stop) x [scan_start,scan_stop)? Default fills
+    /// a scratch profile and checks non-zero; concrete impls override with an early-exit.
+    #[allow(clippy::too_many_arguments)]
+    fn fragment_has_signal_windowed(
+        &self,
+        mz_index: &MZIndex,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) -> bool {
+        if cycle_stop_idx <= cycle_start_idx {
+            return false;
+        }
+        let mut buf = numpy::ndarray::Array1::<f32>::zeros(cycle_stop_idx - cycle_start_idx);
+        self.fill_xic_slice_mobility_windowed(
+            mz_index,
+            &mut buf.view_mut(),
+            cycle_start_idx,
+            cycle_stop_idx,
+            scan_start,
+            scan_stop,
+            mass_tolerance,
+            mz,
+        );
+        buf.iter().any(|&x| x != 0.0)
+    }
+
     fn fill_xic_slice(
         &self,
         mz_index: &MZIndex,

@@ -162,8 +162,10 @@ pub fn calculate_correlation_safe(x: &[f32], y: &[f32]) -> f32 {
     let correlation = covariance / (f32::sqrt(x_variance) * f32::sqrt(y_variance));
 
     // Check for NaN or infinite values
+    // S5 fix: return 0.0 like the other guards above (zero-variance, length checks) instead of
+    // panicking. This function runs inside rayon par_iter; a panic here poisons the whole run.
     if correlation.is_nan() || correlation.is_infinite() {
-        panic!("correlation.is_nan() || correlation.is_infinite()");
+        return 0.0;
     }
 
     // Clamp to valid range [-1, 1]
@@ -459,20 +461,38 @@ pub fn calculate_fwhm_rt(
         return 0.0;
     }
 
-    let half_size = xic_profile.len() / 2;
-    let center_intensity = xic_profile[half_size];
-
-    for i in 0..half_size {
-        let mean_intensity = (xic_profile[half_size - i] + xic_profile[half_size + i]) / 2.0;
-
-        if mean_intensity <= center_intensity / 2.0 {
-            let left_rt = rt_values[cycle_start_idx + half_size - i];
-            let right_rt = rt_values[cycle_start_idx + half_size + i];
-            return right_rt - left_rt;
-        }
+    // PHASE-0 FIX: find the ACTUAL apex (argmax), do NOT assume it sits at the profile center.
+    // The extraction window is centered on the PREDICTED RT; with a coarse predictor (delta_rt != 0,
+    // e.g. 38s off) the true peak is off-center, so the old `xic_profile[len/2]`-as-apex assumption
+    // compared against a shoulder value and almost always returned 0 (fwhm_rt=0 even on clean peaks).
+    let n = xic_profile.len();
+    let apex = xic_profile
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(n / 2);
+    let peak = xic_profile[apex];
+    if peak <= 0.0 {
+        return 0.0;
     }
-
-    0.0
+    let half = peak / 2.0;
+    // walk out from the apex to the half-maximum crossings on each side
+    let mut l = apex;
+    while l > 0 && xic_profile[l] > half {
+        l -= 1;
+    }
+    let mut r = apex;
+    while r < n - 1 && xic_profile[r] > half {
+        r += 1;
+    }
+    let li = cycle_start_idx + l;
+    let ri = cycle_start_idx + r;
+    if ri < rt_values.len() && li < rt_values.len() && ri > li {
+        rt_values[ri] - rt_values[li]
+    } else {
+        0.0
+    }
 }
 
 // ============================================================================
@@ -637,12 +657,45 @@ pub struct Ms1IsotopeFeatures {
     pub iso_frag_minus_c13: [f32; 6],
     /// Sum of the 6 anti-feature correlations (1 score).
     pub iso_frag_minus_c13_sum: f32,
+    /// --- Isotope-envelope-RATIO panel (A2; AlphaDIA `isotope_intensity_correlation`) ---
+    /// These three test the THEORETICAL vs OBSERVED precursor isotope envelope
+    /// (M:M+1:M+2:M+3) ACROSS the isotope axis — a true ratio/shape match, unlike
+    /// the co-elution features above which correlate each channel in TIME.
+    /// Pearson r(theo[0..K], obs[0..K]) across the isotope axis. AlphaDIA's
+    /// `isotope_intensity_correlation` (exact analogue). 0.0 if not computable.
+    pub iso_pattern_corr: f32,
+    /// Spectral-contrast angle 1 - (2/pi)*acos(cos(theo,obs)) over the K+1 peaks.
+    /// Bounded [0,1], variance-stable. 0.0 if either vector has zero norm.
+    pub iso_pattern_sa: f32,
+    /// |obs[1]/obs[0] - theo[1]/theo[0]| — the M+1/M ratio residual (most
+    /// information-rich single discriminator). Sentinel 1.0 if obs[0] <= 0.
+    pub iso_m1_over_m_residual: f32,
+    /// --- MS1 signal-MAGNITUDE panel (#51; not a shape/correlation score) ---
+    /// Integrated MS1 monoisotope XIC over the scored RT window (Σ of the base-tol
+    /// precursor XIC). Absolute abundance — the linear engine rollup never had a raw
+    /// MS1 magnitude term; a true peak concentrates MS1 signal, a wrong-RT null does not.
+    pub ms1_area: f32,
+    /// Apex (max) of the MS1 monoisotope XIC over the window. 0.0 if no MS1 signal.
+    pub ms1_apex: f32,
+    /// Total MS1 signal = Σ over the M/M+1/M+2 isotope XICs (whole envelope), not just
+    /// the monoisotope. Distinguishes a real isotope-bearing precursor from a lone spike.
+    pub ms1_total: f32,
+    /// PHASE-0 FOLD-IN (SN oracle S/N 0.88, split-shape 0.88/0.92):
+    /// precursor signal-to-noise = MS1 monoisotope apex / off-apex MS1 baseline.
+    pub precursor_snr: f32,
+    /// fragment signal-to-noise = median matched-fragment apex / off-apex fragment baseline.
+    pub fragment_snr: f32,
+    /// MS1-chromatogram shape (peak width of the MS1 monoisotope XIC), SEPARATE from the MS2
+    /// fragment-consensus fwhm_rt — the "split MS1 vs MS2 shape" the oracle ranks 0.88/0.92.
+    pub ms1_shape_fwhm: f32,
 }
 
 impl Ms1IsotopeFeatures {
-    /// Flatten to the 14 feature values in the canonical order used by
-    /// `FEATURE_NAMES` / `CandidateFeature`.
-    pub fn as_array(&self) -> [f32; 14] {
+    /// Flatten to the 20 feature values in the canonical order used by
+    /// `FEATURE_NAMES` / `CandidateFeature`. Positions 14..16 are the A2
+    /// isotope-envelope-ratio panel; positions 17..19 are the #51 MS1
+    /// signal-magnitude panel (area / apex / total), appended last.
+    pub fn as_array(&self) -> [f32; 23] {
         [
             self.ms1_coelution_base,
             self.ms1_coelution_045,
@@ -658,6 +711,165 @@ impl Ms1IsotopeFeatures {
             self.iso_frag_minus_c13[4],
             self.iso_frag_minus_c13[5],
             self.iso_frag_minus_c13_sum,
+            self.iso_pattern_corr,
+            self.iso_pattern_sa,
+            self.iso_m1_over_m_residual,
+            self.ms1_area,
+            self.ms1_apex,
+            self.ms1_total,
+            self.precursor_snr,
+            self.fragment_snr,
+            self.ms1_shape_fwhm,
         ]
     }
+}
+
+/// Theoretical precursor isotope envelope `[M, M+1, M+2, M+3]`, normalized to Σ=1.
+///
+/// MODEL (averagine, v1). The Rust scoring layer does NOT receive the peptide
+/// sequence or its elemental formula — only `naa` (length), `mz` and `charge`
+/// reach `Precursor`. We therefore estimate the elemental composition with the
+/// classic **averagine** residue (Senko et al. 1995): per amino-acid residue,
+/// C 4.9384, H 7.7583, N 1.3577, O 1.4773, S 0.0417 atoms. Multiplying by `naa`
+/// gives the expected atom counts for the peptide. (If `naa` is missing/0 we fall
+/// back to estimating residue count from the neutral mass `mz*charge` over the
+/// averagine residue mass 111.1254 Da.) We then convolve the per-element binomial
+/// isotope distributions and keep the first 4 peaks.
+///
+/// Heavy-isotope natural abundances (IUPAC): C13 1.07%, N15 0.368%, O18 0.205%
+/// (the +2 O17 0.038% is folded approximately via O18 only — dominant +2 from O is
+/// negligible vs C2), S34 4.25% (a +2 element, its mass shift ≈ +2 nominal), and
+/// H2 0.0115% (tiny; included for completeness). This is a carbon-DOMINANT model
+/// with N,O,S,H included, sufficient for a 4-peak relative-shape match; it is the
+/// standard approach when only peptide length/mass is known.
+pub fn theoretical_isotope_envelope(naa: u8, charge: u8, mz: f32) -> [f32; 4] {
+    const K: usize = 4; // M .. M+3
+    // ----- 1. expected residue count -----
+    let n_res: f32 = if naa > 0 {
+        naa as f32
+    } else if charge > 0 && mz > 0.0 {
+        // neutral monoisotopic mass / averagine residue mass (approx, minus water)
+        let neutral = mz * charge as f32 - charge as f32 * 1.007276;
+        ((neutral - 18.0106) / 111.1254).max(1.0)
+    } else {
+        return {
+            let mut e = [0.0f32; K];
+            e[0] = 1.0;
+            e
+        };
+    };
+
+    // ----- 2. averagine atom counts (Senko 1995 residue composition) -----
+    // atoms-per-residue * n_res. Backbone water (H2O) added once.
+    let n_c = (4.9384 * n_res).round() as u32;
+    let n_h = (7.7583 * n_res).round() as u32 + 2; // + H2 of terminal water
+    let n_n = (1.3577 * n_res).round() as u32;
+    let n_o = (1.4773 * n_res).round() as u32 + 1; // + O of terminal water
+    let n_s = (0.0417 * n_res).round() as u32;
+
+    // ----- 3. per-element isotope distributions (as polynomials over nominal
+    // mass shift), then convolve. Each element contributes a binomial over its
+    // heavy isotope; we only track shifts 0..=K-1. +2-mass isotopes (O18, S34)
+    // add directly at shift +2.
+    // p = heavy fraction; q = 1 - p. Binomial P(j heavy) = C(n,j) p^j q^(n-j),
+    // each heavy atom shifts the envelope by `delta` nominal mass units.
+    let mut env = [0.0f64; K];
+    env[0] = 1.0;
+
+    let convolve_binomial = |env: &mut [f64; K], n: u32, p: f64, delta: usize| {
+        if n == 0 || p <= 0.0 || delta == 0 || delta >= K {
+            return;
+        }
+        let q = 1.0 - p;
+        // element distribution over peak-index (in units of `delta`): up to K peaks.
+        let max_j = (K - 1) / delta; // how many heavy atoms still land within K
+        let mut elem = [0.0f64; K];
+        // binomial coefficient running product
+        let mut comb = 1.0f64;
+        for j in 0..=max_j {
+            // C(n,j) * p^j * q^(n-j)
+            let prob = comb * p.powi(j as i32) * q.powi((n as i32) - (j as i32));
+            elem[j * delta] += prob;
+            // update comb -> C(n, j+1) = C(n,j) * (n-j)/(j+1)
+            comb *= (n as f64 - j as f64) / (j as f64 + 1.0);
+        }
+        // convolve env *= elem (truncated to K)
+        let mut out = [0.0f64; K];
+        for a in 0..K {
+            if env[a] == 0.0 {
+                continue;
+            }
+            for b in 0..(K - a) {
+                out[a + b] += env[a] * elem[b];
+            }
+        }
+        *env = out;
+    };
+
+    // C13 (+1), N15 (+1), H2 (+1) all shift by 1; O18 (+2), S34 (+2) shift by 2.
+    convolve_binomial(&mut env, n_c, 0.0107, 1);
+    convolve_binomial(&mut env, n_n, 0.00368, 1);
+    convolve_binomial(&mut env, n_h, 0.000115, 1);
+    convolve_binomial(&mut env, n_o, 0.00205, 2);
+    convolve_binomial(&mut env, n_s, 0.0425, 2);
+
+    // ----- 4. normalize Σ=1 -----
+    let sum: f64 = env.iter().sum();
+    let mut out = [0.0f32; K];
+    if sum > 0.0 {
+        for i in 0..K {
+            out[i] = (env[i] / sum) as f32;
+        }
+    } else {
+        out[0] = 1.0;
+    }
+    out
+}
+
+/// The 3 isotope-envelope-ratio match metrics from (theoretical, observed)
+/// envelopes of equal length. Returns `(iso_pattern_corr, iso_pattern_sa,
+/// iso_m1_over_m_residual)`.
+///
+/// - `iso_pattern_corr`: Pearson r across the isotope axis (reuses
+///   `calculate_correlation_safe`; AlphaDIA's `isotope_intensity_correlation`).
+/// - `iso_pattern_sa`: spectral-contrast angle `1 - (2/pi)*acos(cos)`, cos =
+///   dot(theo,obs)/(||theo|| ||obs||); guard zero-norm -> 0.0.
+/// - `iso_m1_over_m_residual`: `|obs[1]/obs[0] - theo[1]/theo[0]|`; sentinel 1.0
+///   when obs[0] <= 0 (no monoisotopic signal observed).
+pub fn iso_pattern_metrics(theo: &[f32], obs: &[f32]) -> (f32, f32, f32) {
+    if theo.len() != obs.len() || theo.len() < 2 {
+        return (0.0, 0.0, 1.0);
+    }
+
+    // (1) Pearson r across the isotope axis.
+    let corr = calculate_correlation_safe(theo, obs);
+
+    // (2) spectral-contrast angle over the raw (non-normalized) vectors.
+    let mut dot = 0.0f64;
+    let mut nt = 0.0f64;
+    let mut no = 0.0f64;
+    for i in 0..theo.len() {
+        let t = theo[i] as f64;
+        let o = obs[i] as f64;
+        dot += t * o;
+        nt += t * t;
+        no += o * o;
+    }
+    let sa = if nt <= 0.0 || no <= 0.0 {
+        0.0f32
+    } else {
+        let cos = (dot / (nt.sqrt() * no.sqrt())).clamp(-1.0, 1.0);
+        (1.0 - 2.0 * cos.acos() / std::f64::consts::PI).clamp(0.0, 1.0) as f32
+    };
+
+    // (3) M+1/M ratio residual.
+    let residual = if obs[0] <= 0.0 {
+        1.0f32 // sentinel: no observed monoisotopic peak
+    } else {
+        let obs_ratio = obs[1] / obs[0];
+        let theo_ratio = if theo[0] > 0.0 { theo[1] / theo[0] } else { 0.0 };
+        (obs_ratio - theo_ratio).abs()
+    };
+
+    (corr, sa, residual)
 }

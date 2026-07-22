@@ -33,6 +33,7 @@ pub const FEATURE_NAMES: &[&str] = &[
     "longest_y_series",
     "naa",
     "weighted_mass_error",
+    "weighted_mass_error_signed",
     "log10_b_ion_intensity",
     "log10_y_ion_intensity",
     "fwhm_rt",
@@ -65,6 +66,15 @@ pub const FEATURE_NAMES: &[&str] = &[
     "iso_frag_minus_c13_4",
     "iso_frag_minus_c13_5",
     "iso_frag_minus_c13_sum",
+    "iso_pattern_corr",
+    "iso_pattern_sa",
+    "iso_m1_over_m_residual",
+    "ms1_area",
+    "ms1_apex",
+    "ms1_total",
+    "precursor_snr",
+    "fragment_snr",
+    "ms1_shape_fwhm",
 ];
 
 #[derive(Debug, Clone)]
@@ -100,6 +110,9 @@ pub struct CandidateFeature {
     pub longest_y_series: f32,
     pub naa: f32,
     pub weighted_mass_error: f32,
+    /// C6: intensity-weighted mean SIGNED mass error (ppm). Signed counterpart of
+    /// weighted_mass_error; consumed by the L2 mass recalibration in extract_feats.py.
+    pub weighted_mass_error_signed: f32,
     pub log10_b_ion_intensity: f32,
     pub log10_y_ion_intensity: f32,
     pub fwhm_rt: f32,
@@ -135,6 +148,23 @@ pub struct CandidateFeature {
     pub iso_frag_minus_c13_4: f32,
     pub iso_frag_minus_c13_5: f32,
     pub iso_frag_minus_c13_sum: f32,
+    // Isotope-envelope-ratio panel (A2; theoretical-vs-observed precursor envelope).
+    pub iso_pattern_corr: f32,
+    pub iso_pattern_sa: f32,
+    pub iso_m1_over_m_residual: f32,
+    // MS1 signal-magnitude panel (#51; absolute abundance, not a shape score).
+    pub ms1_area: f32,
+    pub ms1_apex: f32,
+    pub ms1_total: f32,
+    pub precursor_snr: f32,
+    pub fragment_snr: f32,
+    pub ms1_shape_fwhm: f32,
+    /// Observed per-fragment intensities (aligned to library fragment order). Not a scoring feature;
+    /// emitted via to_dict_arrays for empirical refined-library building (B1.3). Default empty.
+    pub observed_frag_intensities: Vec<f32>,
+    /// PHASE B: fixed-size apex-aligned dense XIC tensor (K frag + 3 MS1 channels) x C cycles, row-major
+    /// [(K+3) x C], for the learned DeepXIC shape scorer. Empty unless DENSEXIC=1. Not a scoring feature.
+    pub densexic_tensor: Vec<f32>,
 }
 
 impl CandidateFeature {
@@ -171,6 +201,7 @@ impl CandidateFeature {
         longest_y_series: f32,
         naa: f32,
         weighted_mass_error: f32,
+        weighted_mass_error_signed: f32,
         log10_b_ion_intensity: f32,
         log10_y_ion_intensity: f32,
         fwhm_rt: f32,
@@ -203,6 +234,15 @@ impl CandidateFeature {
         iso_frag_minus_c13_4: f32,
         iso_frag_minus_c13_5: f32,
         iso_frag_minus_c13_sum: f32,
+        iso_pattern_corr: f32,
+        iso_pattern_sa: f32,
+        iso_m1_over_m_residual: f32,
+        ms1_area: f32,
+        ms1_apex: f32,
+        ms1_total: f32,
+        precursor_snr: f32,
+        fragment_snr: f32,
+        ms1_shape_fwhm: f32,
     ) -> Self {
         Self {
             precursor_idx,
@@ -236,6 +276,7 @@ impl CandidateFeature {
             longest_y_series,
             naa,
             weighted_mass_error,
+            weighted_mass_error_signed,
             log10_b_ion_intensity,
             log10_y_ion_intensity,
             fwhm_rt,
@@ -268,6 +309,17 @@ impl CandidateFeature {
             iso_frag_minus_c13_4,
             iso_frag_minus_c13_5,
             iso_frag_minus_c13_sum,
+            iso_pattern_corr,
+            iso_pattern_sa,
+            iso_m1_over_m_residual,
+            ms1_area,
+            ms1_apex,
+            ms1_total,
+            precursor_snr,
+            fragment_snr,
+            ms1_shape_fwhm,
+            observed_frag_intensities: Vec::new(),
+            densexic_tensor: Vec::new(),
         }
     }
 }
@@ -334,6 +386,7 @@ impl CandidateFeatureCollection {
         let mut longest_y_series = Array1::<f32>::zeros(n);
         let mut naa = Array1::<f32>::zeros(n);
         let mut weighted_mass_errors = Array1::<f32>::zeros(n);
+        let mut weighted_mass_errors_signed = Array1::<f32>::zeros(n);
         let mut log10_b_ion_intensity = Array1::<f32>::zeros(n);
         let mut log10_y_ion_intensity = Array1::<f32>::zeros(n);
         let mut fwhm_rt = Array1::<f32>::zeros(n);
@@ -366,6 +419,12 @@ impl CandidateFeatureCollection {
         let mut iso_frag_minus_c13_4 = Array1::<f32>::zeros(n);
         let mut iso_frag_minus_c13_5 = Array1::<f32>::zeros(n);
         let mut iso_frag_minus_c13_sum = Array1::<f32>::zeros(n);
+        let mut iso_pattern_corr = Array1::<f32>::zeros(n);
+        let mut iso_pattern_sa = Array1::<f32>::zeros(n);
+        let mut iso_m1_over_m_residual = Array1::<f32>::zeros(n);
+        let mut ms1_area = Array1::<f32>::zeros(n);
+        let mut ms1_apex = Array1::<f32>::zeros(n);
+        let mut ms1_total = Array1::<f32>::zeros(n);
 
         for (i, feature) in self.features.iter().enumerate() {
             precursor_idxs[i] = feature.precursor_idx as u64;
@@ -399,6 +458,7 @@ impl CandidateFeatureCollection {
             longest_y_series[i] = feature.longest_y_series;
             naa[i] = feature.naa;
             weighted_mass_errors[i] = feature.weighted_mass_error;
+            weighted_mass_errors_signed[i] = feature.weighted_mass_error_signed;
             log10_b_ion_intensity[i] = feature.log10_b_ion_intensity;
             log10_y_ion_intensity[i] = feature.log10_y_ion_intensity;
             fwhm_rt[i] = feature.fwhm_rt;
@@ -431,6 +491,12 @@ impl CandidateFeatureCollection {
             iso_frag_minus_c13_4[i] = feature.iso_frag_minus_c13_4;
             iso_frag_minus_c13_5[i] = feature.iso_frag_minus_c13_5;
             iso_frag_minus_c13_sum[i] = feature.iso_frag_minus_c13_sum;
+            iso_pattern_corr[i] = feature.iso_pattern_corr;
+            iso_pattern_sa[i] = feature.iso_pattern_sa;
+            iso_m1_over_m_residual[i] = feature.iso_m1_over_m_residual;
+            ms1_area[i] = feature.ms1_area;
+            ms1_apex[i] = feature.ms1_apex;
+            ms1_total[i] = feature.ms1_total;
         }
 
         let dict = PyDict::new(py);
@@ -499,6 +565,10 @@ impl CandidateFeatureCollection {
         dict.set_item("naa", naa.into_pyarray(py))?;
         dict.set_item("weighted_mass_error", weighted_mass_errors.into_pyarray(py))?;
         dict.set_item(
+            "weighted_mass_error_signed",
+            weighted_mass_errors_signed.into_pyarray(py),
+        )?;
+        dict.set_item(
             "log10_b_ion_intensity",
             log10_b_ion_intensity.into_pyarray(py),
         )?;
@@ -548,6 +618,41 @@ impl CandidateFeatureCollection {
         dict.set_item("iso_frag_minus_c13_4", iso_frag_minus_c13_4.into_pyarray(py))?;
         dict.set_item("iso_frag_minus_c13_5", iso_frag_minus_c13_5.into_pyarray(py))?;
         dict.set_item("iso_frag_minus_c13_sum", iso_frag_minus_c13_sum.into_pyarray(py))?;
+        dict.set_item("iso_pattern_corr", iso_pattern_corr.into_pyarray(py))?;
+        dict.set_item("iso_pattern_sa", iso_pattern_sa.into_pyarray(py))?;
+        dict.set_item("iso_m1_over_m_residual", iso_m1_over_m_residual.into_pyarray(py))?;
+        dict.set_item("ms1_area", ms1_area.into_pyarray(py))?;
+        dict.set_item("ms1_apex", ms1_apex.into_pyarray(py))?;
+        dict.set_item("ms1_total", ms1_total.into_pyarray(py))?;
+
+        // Observed per-fragment intensities, CSR-flattened: a concatenated value array + per-candidate
+        // offsets (len n+1). candidate i's observed fragments = obs_frag_int[obs_frag_off[i]..off[i+1]],
+        // aligned to that precursor's library fragment order. For empirical refined-library building.
+        let mut obs_frag_off = Array1::<u64>::zeros(n + 1);
+        let mut obs_concat: Vec<f32> = Vec::new();
+        let mut obs_acc: u64 = 0;
+        for (i, feature) in self.features.iter().enumerate() {
+            obs_frag_off[i] = obs_acc;
+            obs_concat.extend_from_slice(&feature.observed_frag_intensities);
+            obs_acc += feature.observed_frag_intensities.len() as u64;
+        }
+        obs_frag_off[n] = obs_acc;
+        dict.set_item("obs_frag_int", Array1::from_vec(obs_concat).into_pyarray(py))?;
+        dict.set_item("obs_frag_off", obs_frag_off.into_pyarray(py))?;
+
+        // PHASE B: dense XIC tensors, CSR-flattened (concatenated values + per-candidate offsets). Each
+        // candidate's tensor is a fixed [(K+3) x C] apex-aligned block (empty unless DENSEXIC=1).
+        let mut dxic_off = Array1::<u64>::zeros(n + 1);
+        let mut dxic_concat: Vec<f32> = Vec::new();
+        let mut dxic_acc: u64 = 0;
+        for (i, feature) in self.features.iter().enumerate() {
+            dxic_off[i] = dxic_acc;
+            dxic_concat.extend_from_slice(&feature.densexic_tensor);
+            dxic_acc += feature.densexic_tensor.len() as u64;
+        }
+        dxic_off[n] = dxic_acc;
+        dict.set_item("densexic", Array1::from_vec(dxic_concat).into_pyarray(py))?;
+        dict.set_item("densexic_off", dxic_off.into_pyarray(py))?;
 
         Ok(dict.into())
     }

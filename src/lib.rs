@@ -8,6 +8,7 @@ pub mod constants;
 mod convolution;
 mod dense_xic_observation;
 pub mod dia_data;
+pub mod fragment_index;
 pub mod dia_data_builder;
 pub mod idf;
 mod kernel;

@@ -107,6 +107,46 @@ pub fn calculate_weighted_mean_absolute_error(
     }
 }
 
+/// Calculate weighted mean SIGNED mass error (C6 fix)
+///
+/// Identical to `calculate_weighted_mean_absolute_error` but WITHOUT the `.abs()`,
+/// so the sign of the systematic mass offset is preserved. Needed for the L2 mass
+/// recalibration in extract_feats.py, which must fit a SIGNED ppm error to recenter
+/// the precursor/fragment m/z; an absolute error cannot tell over- from under-calibration.
+///
+/// Parameters:
+/// - mass_errors: Array of mass errors (in ppm)
+/// - intensity_weights: Array of intensity weights (typically library intensities)
+///
+/// Returns:
+/// - Intensity-weighted mean of signed mass errors
+pub fn calculate_weighted_mean_signed_error(
+    mass_errors: &[f32],
+    intensity_weights: &[f32],
+) -> f32 {
+    if mass_errors.len() != intensity_weights.len() || mass_errors.is_empty() {
+        return 0.0;
+    }
+
+    let mut weighted_sum = 0.0f32;
+    let mut weight_sum = 0.0f32;
+
+    for i in 0..mass_errors.len() {
+        let weight = intensity_weights[i];
+        // Only include fragments with non-zero weight and valid mass error
+        if weight > 0.0 && mass_errors[i] != 0.0 {
+            weighted_sum += mass_errors[i] * weight; // signed: no .abs()
+            weight_sum += weight;
+        }
+    }
+
+    if weight_sum > 0.0 {
+        weighted_sum / weight_sum
+    } else {
+        0.0
+    }
+}
+
 /// Calculate median of a slice of f32 values
 ///
 /// Returns the median value. For even-length slices, returns the average of the two middle values.

@@ -18,6 +18,22 @@ pub struct SelectionParameters {
     pub candidate_count: usize,
     #[pyo3(get)]
     pub top_k_fragments: usize,
+    /// Ion-mobility (1/K0) half-width for the SELECTION mobility gate (dia-PASEF).
+    /// When > 0 and the data+library carry mobility, selection integrates ONLY over
+    /// scans whose 1/K0 is within `precursor.mobility ± im_tolerance` (instead of the
+    /// full mobility range) and a precursor with no scan in that band is pruned before
+    /// extraction. 0.0 (default) preserves the historical full-range behavior exactly.
+    #[pyo3(get)]
+    pub im_tolerance: f32,
+    /// Fragment-presence pre-filter: minimum number of library fragments that must have
+    /// ANY observed signal in the precursor's RT/IM window for it to be extracted+scored.
+    /// 0 (default) => OFF, byte-identical to legacy behavior.
+    #[pyo3(get)]
+    pub min_matched_fragments: usize,
+    /// Spectrum-centric fragment-index shortlist: min # of fragments that must CO-OCCUR in a
+    /// cycle for a precursor to be scored. 0 (default) => index OFF (legacy per-precursor loop).
+    #[pyo3(get)]
+    pub fragment_index_min_cofrag: usize,
 }
 
 #[pymethods]
@@ -39,6 +55,11 @@ impl SelectionParameters {
             candidate_count: 3,
             // maximum number of fragments to use for selecting precursors from a DIAData object.
             top_k_fragments: 12,
+            // ion-mobility selection gate half-width (1/K0). 0.0 => OFF (full-range, legacy behavior).
+            im_tolerance: 0.0,
+            // fragment-presence pre-filter threshold; 0 => OFF (legacy).
+            min_matched_fragments: 0,
+            fragment_index_min_cofrag: 0,
         }
     }
 
@@ -63,6 +84,15 @@ impl SelectionParameters {
         }
         if let Some(value) = config.get_item("top_k_fragments")? {
             self.top_k_fragments = value.extract::<usize>()?;
+        }
+        if let Some(value) = config.get_item("im_tolerance")? {
+            self.im_tolerance = value.extract::<f32>()?;
+        }
+        if let Some(value) = config.get_item("min_matched_fragments")? {
+            self.min_matched_fragments = value.extract::<usize>()?;
+        }
+        if let Some(value) = config.get_item("fragment_index_min_cofrag")? {
+            self.fragment_index_min_cofrag = value.extract::<usize>()?;
         }
         Ok(())
     }

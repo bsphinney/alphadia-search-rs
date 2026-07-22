@@ -538,3 +538,123 @@ missingness mask for engine-specific features, and an **entrapment** check on th
 (the ensemble is exactly where FDR inflation hides). This (IM-aware peptide-centric + diaTracer
 spectrum-centric under one calibrated entrapment-validated FDR) would be novel — none of
 DIA-NN/FragPipe/Radiant does it.
+
+---
+
+# PART 6 — Honest caveats, predictor menu, sensitivity roadmap (2026-06-13)
+
+## The library is DIA-NN's own found precursors (load-bearing caveat)
+The 1,433-PG benchmark library was built from DIA-NN 2.5.1's REFINED EMPIRICAL library
+(`diann251_clean16/report-lib.parquet` = 21,707 unique precursors, has a `Q.Value` column = IDs
+DIA-NN *found*, NOT a full in-silico digest). Consequences:
+1. The "no DIA-NN dependency" claim is NOT yet true at depth — DIA-NN sits in the library step.
+2. The engine is CAPPED at DIA-NN's ID set: it re-scores DIA-NN's 21,707 precursors and rolls up to
+   MORE protein groups (the real win), but cannot discover a precursor DIA-NN missed.
+   12,213/17,770 = re-finds ~69% of DIA-NN's own IDs. This is why precursor depth is the gap.
+
+No transfer learning / no PeptDeep was ever in the pipeline.
+
+## Sensitivity roadmap (ranked)
+- LEVER 1 (biggest): replace with a FULL OPEN in-silico predicted library from the dog FASTA via
+  Koina (`Prosit_2023_intensity_timsTOF` MS2 + `AlphaPeptDeep_ccs_generic` / `IM2Deep` IM + an iRT
+  model; REST POST koina.wilhelmlab.org/v2/models/{m}/infer). Removes the DIA-NN dep AND lifts the
+  ceiling above 21,707. If it underperforms, THEN fine-tune AlphaPeptDeep on dog timsTOF (transfer
+  learning) and re-test.
+- LEVER 2: the queued FDR/calibration levers (below), incremental.
+- MBR: NOT implemented here (we do global cross-file FDR pooling, not match-between-runs). The
+  "MBR added 0" disproof was the SEPARATE Sage stack, so MBR is untested in this engine — worth a
+  test, but AFTER the library fix (MBR can only propagate library precursors).
+
+## Radiant DIA implementation scorecard
+DONE: NN classifier (3-fold StratifiedKFold MLP, the depth driver), mobility-error feature,
+global cross-file FDR + PG rollup, entrapment audit, global StandardScaler.
+
+CODED BUT NOT IN THE HEADLINE RUN: mutated decoys (`td_lib_mut.npz` built; 1,433 used pseudo-reverse
+`td_lib.npz`), MixMax FDR + NSP PG scoring (only in the unrun `search16_v2.py`).
+
+NOT DONE: mass-tolerance auto-optimization (fixed 8 ppm), 2nd-order polynomial mass recalibration,
+per-file RT/IM spline calibration, per-fold log-space cross-fold norm, directLFQ quant.
+These not-done calibration levers are the cleanest remaining depth gains after the library fix.
+
+Consolidated cross-session record also kept at DE-LIMP `docs/RUST_DIA_ENGINE.md`.
+
+# PART 7 — Open predictor A/B, all six Radiant levers, full open library (2026-06-13)
+
+Overnight autonomous session. Goal: (a) prove an OPEN MS2 predictor matches DIA-NN's fragments,
+(b) implement + entrapment-validate EVERY Radiant DIA lever, (c) build a full OPEN predicted
+library to lift the DIA-NN-library ceiling. All depth numbers entrapment-calibrated to true 1% FDR
+unless marked "reported-q".
+
+## A. Predictor A/B (Phase A) — open Prosit-timsTOF vs DIA-NN fragments
+
+Identical 20,271-precursor set, identical search+NN+FDR; ONLY the target fragment intensities
+differ. Scripts: `build_lib_ab.py`, `search_ab.py`, `run_ab.sbatch`. Decoy-q thresholds:
+
+| library | q<=0.001 | q<=0.005 | q<=0.01 | q<=0.02 |
+|---|---|---|---|---|
+| DIA-NN fragments  | 8,439 / 1,035 | 9,720 / 1,206 | 10,169 / 1,272 | 10,656 / 1,351 |
+| Koina Prosit-tTOF | 8,536 /  913  | 9,572 / 1,044 |  9,949 / 1,098 | 10,356 / 1,157 |
+
+VERDICT: open predictor recovers 97.8% of DIA-NN's precursors (within ~2%), 86.3% of PGs.
+At the strictest cut (q<=0.001) it EXCEEDS DIA-NN on precursors. The open predictor is validated
+at precursor level; the PG gap is a CE-calibration opportunity (we used fixed CE=30).
+CE sweep (25/28/30/33/36) on a 3,000-precursor subset: `build_ce_sweep.py` + `search_ce.py`.
+CE result: <FILL>.
+
+## B. All six Radiant levers (Phase C) — implemented + measured
+
+Baseline (pseudo-reverse entrap, CORRECTED pg map td-pid=2*tp): 12,850 pr / 1,692 PG @ true 1%.
+Core scoring/FDR primitives in `levers_core.py`; ablation driver `score_levers.py`; re-extraction
+levers via `extract_feats.py` (+ `build_entrap_mut.py`) and `run_extract_levers.sbatch`.
+
+| lever | entrap-cal true-1% (pr / PG) | delta | note |
+|---|---|---|---|
+| BASELINE | 12,850 / 1,692 | — | global scaler NN, TDC, simple PG |
+| L1 mutated decoys | 11,966 / 1,583 | -884 / -109 | HURTS (more conservative decoys) |
+| L2 mass-tol auto-opt + 2nd-ord recal | ~baseline | ~0 | sweep optimum 5-12 ppm; 8 ppm already right; real ~3-5 ppm offset found+corrected |
+| L3 RT/IM per-file spline | 13,644 / 1,748 | +794 / +56 | BEST lever |
+| L4 MixMax FDR | 12,850 / 1,692 (true); reported-q +253 pr | 0 true | helps reported-q only (pi0~0.72) |
+| L5 NSP picked-group PG | 12,850 / 857 | PG recalibrated | honest PG-FDR (naive 1,692 over-counts) |
+| L6 per-fold log-space norm | 12,365 / 1,619 | -485 / -73 | HURTS |
+
+On the L3 (spline) cache the levers stack: L3 alone 13,644/1,748; L3+L4 reported-q 12,177/1,555;
+L3+L5 NSP 13,644 pr / 1,132 honest PG. L1 and L6 hurt and are excluded from the stack; L2 is the
+existing 8 ppm; L4/L5 are FDR-REPORTING refinements (don't raise true depth). Radiant tuned L1/L6
+on Orbitrap; on this timsTOF data pseudo-reverse + global scaler are already better.
+
+BEST VALIDATED STACK = baseline + L3 = 13,644 pr / 1,748 PG (naive) / 1,132 PG (NSP-honest) @ true 1%.
+
+## C. Full OPEN predicted library (Phase B) — peptdeep, no DIA-NN
+
+peptdeep 1.4.2 (AlphaPeptDeep, Apache-2.0) is installed in env alphadia2; pretrained generic
+models at ~/peptdeep/pretrained_models/. Builder `build_openlib.py` digests the dog FASTA
+(DIA-NN-matched: cut K*,R*, MC<=1 [capped], len 7-30, fixed Cys-CAM, var Mox, z2-3, mz 300-1200),
+predicts MS2+RT+CCS, converts CCS->1/K0, emits the flat entrap .npz (dog+yeast, pseudo-reverse
+decoys, species labels, prot map). GPU sbatch `run_openlib.sbatch` (a100).
+
+GOTCHA FOUND: peptdeep on a COMPUTE node hangs (no internet) — model/update fetch blocks. Fix:
+set HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE / PEPTDEEP_OFFLINE before import; rely on local models.
+
+Phase B result: <FILL>.
+
+## Repro file list (all under /quobyte/proteomics-grp/brett/glendon)
+build_lib_ab.py, search_ab.py, run_ab.sbatch | build_ce_sweep.py, search_ce.py, run_ce_search.sbatch
+levers_core.py, score_levers.py, run_levers_extra.sbatch | build_entrap_mut.py, extract_feats.py,
+run_extract_levers.sbatch | build_openlib.py, run_openlib.sbatch
+
+## PART 7 addendum — corrections + final numbers (2026-06-13, post-SSH-recovery)
+
+- **L2 (mass-recal + tol-sweep) final:** 9,914 pr / 1,205 PG reported-q; **13,406 pr / 1,747 PG @
+  entrap-cal true 1%** (+556 pr over baseline, below L3's 13,644). Mass recalibration found a real
+  ~3-5 ppm offset; per-file tol optimum 3-8 ppm after recal → 8 ppm was already near-right.
+- **CE sweep (Phase A) result — DECISIVE:** on a 3,000-precursor subset (LDA-only), Koina library IDs
+  by CE: **CE=25 → 466, CE=28 → 262, CE=30 → 82, CE=33 → 38, CE=36 → 37** (monotonic). The A/B used
+  CE=30 — FAR too high. The open predictor's 97.8% pr / 86.3% PG match therefore UNDERSTATES its true
+  performance; rebuild the full Koina library at CE≈25 (sweep lower too) to likely EXCEED DIA-NN
+  fragments. `build_ce_sweep.py` + `search_ce.py`.
+- **Phase B was NOT blocked — CORRECTION.** I cancelled the first two GPU attempts believing peptdeep
+  hung. A diagnostic (`diag_import.py`/`run_diag.sbatch`) proved otherwise: import is just slow on
+  quobyte — `import torch` 127 s, `import ModelManager` 368 s, `load_installed_models` 1.6 s, total
+  ~8.5 min, then exit 0 / ALL_OK. The jobs were killed right as the import was completing. Fix:
+  give peptdeep jobs ≥15 min headroom (or stage env/torch to node-local /tmp). Phase B resubmitted
+  (job 16040151) — result pending.

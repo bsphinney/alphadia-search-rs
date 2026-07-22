@@ -1,7 +1,7 @@
 use numpy::ndarray::Array1;
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::cmp::{max, min};
+use std::cmp::min;
 use std::time::Instant;
 
 use crate::candidate::{Candidate, CandidateCollection};
@@ -85,7 +85,34 @@ impl PeakGroupSelection {
     }
 
     pub fn search(&self, dia_data: &DIAData, lib: &SpecLibFlat) -> CandidateCollection {
-        self.search_generic(dia_data, lib)
+        if self.params.fragment_index_min_cofrag > 0 {
+            let t0 = Instant::now();
+            let fi = crate::fragment_index::FragmentIndex::build(lib);
+            let keep = fi.shortlist(
+                dia_data,
+                self.params.rt_tolerance,
+                self.params.im_tolerance,
+                self.params.kernel_size,
+                self.params.fragment_index_min_cofrag,
+            );
+            let nkeep = keep.iter().filter(|&&b| b).count();
+            println!(
+                "FragmentIndex shortlist: {}/{} precursors kept ({:.1}%) in {:.1}s",
+                nkeep, keep.len(), 100.0 * nkeep as f32 / keep.len().max(1) as f32, t0.elapsed().as_secs_f32()
+            );
+            if let Ok(path) = std::env::var("FRAG_INDEX_DUMP") {
+                let bytes: Vec<u8> = keep.iter().map(|&b| b as u8).collect();
+                let _ = std::fs::write(&path, &bytes);
+                println!("FragmentIndex: dumped keep mask ({} bytes) to {}", bytes.len(), path);
+            }
+            if std::env::var("FRAG_INDEX_SHORTLIST_ONLY").is_ok() {
+                println!("FRAG_INDEX_SHORTLIST_ONLY set -> returning empty candidates (shortlist-only test)");
+                return CandidateCollection::default();
+            }
+            self.search_generic(dia_data, lib, Some(&keep))
+        } else {
+            self.search_generic(dia_data, lib, None)
+        }
     }
 }
 
@@ -95,33 +122,58 @@ impl PeakGroupSelection {
         &self,
         dia_data: &T,
         lib: &SpecLibFlat,
+        keep: Option<&[bool]>,
     ) -> CandidateCollection {
         let start_time = Instant::now();
+        // Count precursors that survive selection (produced >=1 candidate) vs those
+        // pruned before extraction (RT window empty, or — with the IM gate on —
+        // predicted 1/K0 outside every scan). This is the candidate-reduction number
+        // that pruning is meant to cut; reported below alongside throughput.
+        let pruned = std::sync::atomic::AtomicUsize::new(0);
         // Parallel iteration over precursor indices with filter_map to collect candidates
         let candidates: Vec<Candidate> = (0..lib.num_precursors())
             .into_par_iter()
             .filter_map(|i| {
+                if let Some(k) = keep {
+                    if !k[i] {
+                        pruned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return None;
+                    }
+                }
                 let precursor = lib.get_precursor_filtered(
                     i,
                     true, // Always filter non-zero intensities for scoring
                     true, // Filter Y1 ions by default
                     self.params.top_k_fragments,
                 );
-                self.search_precursor_generic(
+                let out = self.search_precursor_generic(
                     dia_data,
                     &precursor,
                     self.params.mass_tolerance,
                     self.params.rt_tolerance,
                     self.params.candidate_count,
-                )
+                );
+                if out.is_none() {
+                    pruned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                out
             })
             .flatten()
             .collect();
         let end_time = Instant::now();
         let duration = end_time.duration_since(start_time);
 
-        let precursors_per_second = lib.num_precursors() as f32 / duration.as_secs_f32();
+        let n_pre = lib.num_precursors();
+        let n_pruned = pruned.load(std::sync::atomic::Ordering::Relaxed);
+        let precursors_per_second = n_pre as f32 / duration.as_secs_f32();
         println!("Precursors per second: {precursors_per_second:?}");
+        println!(
+            "Pruned {}/{} precursors before extraction ({:.1}%) [im_tol={}]",
+            n_pruned,
+            n_pre,
+            100.0 * n_pruned as f32 / n_pre.max(1) as f32,
+            self.params.im_tolerance
+        );
         println!("Found {} candidates", candidates.len());
 
         CandidateCollection::from_vec(candidates)
@@ -147,17 +199,68 @@ impl PeakGroupSelection {
             return None;
         }
 
-        // Create dense XIC observation using the filtered precursor fragments.
-        // Selection integrates over the full ion-mobility range so that no
-        // precursor is missed; the per-candidate mobility window is determined
-        // below (mobility apex) and refined further in scoring.
-        let sel_scan_stop = if dia_data.has_mobility() { dia_data.num_scans() } else { 1 };
+        // Selection scan (ion-mobility) window. Historically selection integrated
+        // over the FULL mobility range (0..num_scans) so no precursor is missed.
+        // With `im_tolerance > 0` (dia-PASEF), we PRUNE selection to only the scans
+        // whose 1/K0 is within `precursor.mobility ± im_tolerance` — this is a proper
+        // ion-mobility candidate gate (the audit noted delta_mobility was only a
+        // scoring feature, never a gate). It both cuts extraction work and removes
+        // co-eluting-but-wrong-mobility decoy competition. A precursor whose predicted
+        // 1/K0 has no matching scan is pruned entirely (returns None below).
+        let (sel_scan_start, sel_scan_stop) = if dia_data.has_mobility() {
+            if self.params.im_tolerance > 0.0 && precursor.mobility > 0.0 {
+                match Self::mobility_scan_band(dia_data, precursor.mobility, self.params.im_tolerance)
+                {
+                    Some(band) => band,
+                    None => return None, // predicted 1/K0 outside every scan's mobility -> prune
+                }
+            } else {
+                (0, dia_data.num_scans())
+            }
+        } else {
+            (0, 1)
+        };
+        // Fragment-presence pre-filter (fragment-index screen): require at least
+        // `min_matched_fragments` of the precursor's library fragments to have ANY
+        // observed signal in this RT/IM window BEFORE paying for dense-XIC extraction +
+        // convolution + scoring. Prunes signal-free (noise/decoy/foreign) precursors.
+        // 0 => OFF (byte-identical to legacy).
+        if self.params.min_matched_fragments > 0 {
+            let valid_obs = dia_data.get_valid_observations(precursor.mz);
+            let mut matched = 0usize;
+            for &f_mz in precursor.fragment_mz.iter() {
+                let mut present = false;
+                for &obs_idx in &valid_obs {
+                    if dia_data.quadrupole_observations()[obs_idx].fragment_has_signal_windowed(
+                        dia_data.mz_index(),
+                        cycle_start_idx,
+                        cycle_stop_idx,
+                        sel_scan_start,
+                        sel_scan_stop,
+                        mass_tolerance,
+                        f_mz,
+                    ) {
+                        present = true;
+                        break;
+                    }
+                }
+                if present {
+                    matched += 1;
+                    if matched >= self.params.min_matched_fragments {
+                        break;
+                    }
+                }
+            }
+            if matched < self.params.min_matched_fragments {
+                return None;
+            }
+        }
         let dense_xic_obs = DenseXICObservation::new(
             dia_data,
             precursor.mz,
             cycle_start_idx,
             cycle_stop_idx,
-            0,
+            sel_scan_start,
             sel_scan_stop,
             mass_tolerance,
             &precursor.fragment_mz,
@@ -179,7 +282,10 @@ impl PeakGroupSelection {
             let cycle_center_idx = local_maxima_indices[i];
             let score = local_maxima_values[i];
 
-            let cycle_start_idx = max(0, cycle_center_idx - self.params.peak_length);
+            // C1 fix: cycle_center_idx and peak_length are usize; `max(0, a - b)` underflows
+            // (wraps to a huge usize) on early-eluting precursors before max(0,..) can clamp.
+            // saturating_sub clamps the subtraction at 0 correctly.
+            let cycle_start_idx = cycle_center_idx.saturating_sub(self.params.peak_length);
             let cycle_stop_idx = min(
                 cycle_center_idx + self.params.peak_length + 1,
                 dia_data.rt_index().len(),
@@ -214,6 +320,44 @@ impl PeakGroupSelection {
         }
 
         Some(candidates)
+    }
+
+    /// Ion-mobility candidate gate: return the contiguous scan window
+    /// `[scan_lo, scan_hi)` whose per-scan 1/K0 lies within
+    /// `predicted_mobility ± im_tolerance`, or `None` if NO scan qualifies (the
+    /// predicted mobility is outside the instrument's mobility range for this run,
+    /// so the precursor is pruned before any extraction). Scans of a timsTOF frame
+    /// are monotonic in 1/K0, but we do not rely on that: we take the min/max
+    /// qualifying scan index so the returned window is a superset of all in-band
+    /// scans regardless of ordering direction.
+    fn mobility_scan_band<T: DIADataTrait>(
+        dia_data: &T,
+        predicted_mobility: f32,
+        im_tolerance: f32,
+    ) -> Option<(usize, usize)> {
+        let num_scans = dia_data.num_scans();
+        if num_scans <= 1 {
+            return Some((0, num_scans.max(1)));
+        }
+        let lo_k0 = predicted_mobility - im_tolerance;
+        let hi_k0 = predicted_mobility + im_tolerance;
+        let mut lo: Option<usize> = None;
+        let mut hi: usize = 0;
+        for s in 0..num_scans {
+            let k0 = dia_data.mobility_of_scan(s);
+            // mobility_of_scan returns 0.0 when a per-scan 1/K0 is unavailable; a
+            // 0.0 sentinel is not a real mobility, so skip it (never gate on it).
+            if k0 <= 0.0 {
+                continue;
+            }
+            if k0 >= lo_k0 && k0 <= hi_k0 {
+                if lo.is_none() {
+                    lo = Some(s);
+                }
+                hi = s;
+            }
+        }
+        lo.map(|l| (l, hi + 1))
     }
 
     /// Determine an ion-mobility (scan) window for a candidate by summing the

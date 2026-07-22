@@ -37,6 +37,43 @@ pub struct QuadrupoleObservation {
 }
 
 impl QuadrupoleObservation {
+    /// Early-exit presence check for the fragment-presence pre-filter. Returns true on
+    /// the first peak of `mz` (+/- ppm) within [cycle_start,cycle_stop) x [scan window).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fragment_has_signal_windowed(
+        &self,
+        mz_index: &MZIndex,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) -> bool {
+        let has_mob = self.has_mobility();
+        let delta_mz = mz * mass_tolerance * 1e-6;
+        let lower_mz = mz - delta_mz;
+        let upper_mz = mz + delta_mz;
+        for mz_idx in mz_index.mz_range_indices(lower_mz, upper_mz) {
+            let start = self.slice_starts[mz_idx] as usize;
+            let stop = self.slice_starts[mz_idx + 1] as usize;
+            for i in start..stop {
+                let cycle_idx = self.cycle_indices[i] as usize;
+                if cycle_idx < cycle_start_idx || cycle_idx >= cycle_stop_idx {
+                    continue;
+                }
+                if has_mob {
+                    let scan_idx = self.scan_indices[i] as usize;
+                    if scan_idx < scan_start || scan_idx >= scan_stop {
+                        continue;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     /// Create a new empty observation with exact pre-allocation
     pub fn new_with_capacity(
         isolation_window: [f32; 2],
@@ -321,6 +358,28 @@ impl QuadrupoleObservation {
 
 // Implement the QuadrupoleObservationTrait for QuadrupoleObservation
 impl crate::traits::QuadrupoleObservationTrait for QuadrupoleObservation {
+    #[allow(clippy::too_many_arguments)]
+    fn fragment_has_signal_windowed(
+        &self,
+        mz_index: &crate::mz_index::MZIndex,
+        cycle_start_idx: usize,
+        cycle_stop_idx: usize,
+        scan_start: usize,
+        scan_stop: usize,
+        mass_tolerance: f32,
+        mz: f32,
+    ) -> bool {
+        self.fragment_has_signal_windowed(
+            mz_index,
+            cycle_start_idx,
+            cycle_stop_idx,
+            scan_start,
+            scan_stop,
+            mass_tolerance,
+            mz,
+        )
+    }
+
     fn fill_xic_slice(
         &self,
         mz_index: &crate::mz_index::MZIndex,

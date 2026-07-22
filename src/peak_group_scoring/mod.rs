@@ -92,6 +92,8 @@ impl PeakGroupScoring {
         // for real fragments (engine note), so a full-window COELUT_THRESH over-excludes; apex-
         // centering recovers the true co-elution (~0.6), the same trick the MS1 feature uses.
         let coelut_apex: bool = std::env::var("COELUT_APEX").ok().as_deref() == Some("1");
+        // PHASE B: dump the apex-aligned dense XIC tensor per candidate (for the learned shape scorer).
+        let densexic: bool = std::env::var("DENSEXIC").ok().as_deref() == Some("1");
 
         // Parallel iteration over candidates to score each one
         let scored_candidates: Vec<CandidateFeature> = candidates
@@ -113,6 +115,7 @@ impl PeakGroupScoring {
                         ms1_clean,
                         ms1_clean_pow,
                         coelut_apex,
+                        densexic,
                     ),
                     None => {
                         eprintln!(
@@ -165,6 +168,7 @@ impl PeakGroupScoring {
         ms1_clean: bool,
         ms1_clean_pow: f32,
         coelut_apex: bool,
+        densexic: bool,
     ) -> Option<CandidateFeature> {
         // Scoring implementation for individual candidate will be added here
         // For now, return the original score
@@ -636,6 +640,19 @@ impl PeakGroupScoring {
                 ms1iso.ms1_area
             };
 
+            // PHASE-0 FOLD-IN: precursor S/N (MS1 apex / lower-quartile MS1 baseline) + MS1-chromatogram
+            // shape width (peak width of the MS1 monoisotope XIC) — the "split MS1 vs MS2 shape" signal,
+            // distinct from the MS2 fragment-consensus fwhm_rt.
+            {
+                let apex = ms1iso.ms1_apex;
+                let mut sv: Vec<f32> = xic_base.clone();
+                sv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let base = if sv.len() >= 4 { sv[sv.len() / 4].max(1e-6) } else { 1e-6 };
+                ms1iso.precursor_snr = if apex > 0.0 { apex / base } else { 0.0 };
+                ms1iso.ms1_shape_fwhm =
+                    calculate_fwhm_rt(&xic_base, cycle_start_idx, &dia_data.rt_index().rt);
+            }
+
             // ---- MS1 INTERFERENCE CLEANING (fix #2) ----
             // ms1_area is the engine's DOMINANT scoring feature, but the wide dia-PASEF
             // isolation window lets other co-eluting precursors contaminate the MS1 signal
@@ -659,6 +676,28 @@ impl PeakGroupScoring {
                 ms1iso.ms1_apex *= gate;
                 ms1iso.ms1_total *= gate;
             }
+        }
+        // PHASE-0 FOLD-IN: fragment S/N = median over matched fragments of (apex / lower-quartile baseline).
+        {
+            let dx = &dense_xic_mz_obs.dense_xic;
+            let nfr = dx.dim().0;
+            let mut ratios: Vec<f32> = Vec::new();
+            for r in 0..nfr {
+                let row = dx.row(r);
+                let apex = row.iter().cloned().fold(0.0f32, f32::max);
+                if apex <= 0.0 {
+                    continue;
+                }
+                let mut v: Vec<f32> = row.to_vec();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let base = if v.len() >= 4 { v[v.len() / 4].max(1e-6) } else { 1e-6 };
+                ratios.push(apex / base);
+            }
+            ms1iso.fragment_snr = if !ratios.is_empty() {
+                calculate_median(&ratios)
+            } else {
+                0.0
+            };
         }
         let ms1_arr = ms1iso.as_array();
 
@@ -734,10 +773,87 @@ impl PeakGroupScoring {
             ms1_arr[17],
             ms1_arr[18],
             ms1_arr[19],
+            ms1_arr[20],
+            ms1_arr[21],
+            ms1_arr[22],
         );
         // empirical-refinement: carry the observed per-fragment intensities (aligned to library
         // fragment order) out of scoring so the refined-library builder can rebuild observed spectra.
         __feat.observed_frag_intensities = observation_intensities.to_vec();
+        // PHASE B: apex-aligned dense XIC tensor [(K+3) x C], row-major, for the learned shape scorer.
+        // K=12 fragment chromatograms (top by library intensity) + 3 MS1 channels (M/M+1/M+2), each a
+        // C=13-cycle window centered on the consensus-profile apex (pad with 0 out of range), per-row
+        // normalized. Only built when DENSEXIC=1. Same extraction batch for targets AND decoys (leak-safe).
+        // MEMORY: materialize dense-XIC tensor only for the top candidate per precursor (rank 0);
+        // retaining it for all ~6x candidates OOMs at whole-proteome scale.
+        if densexic && candidate.rank == 0 {
+            const K: usize = 12;
+            const C: usize = 13;
+            const HALF: isize = 6;
+            let refp = median_profile_filtered.as_slice();
+            let nref = refp.len();
+            let apex = refp
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(nref / 2) as isize;
+            let alo = apex - HALF;
+            let mut order: Vec<usize> = (0..precursor.fragment_intensity.len()).collect();
+            order.sort_by(|&a, &b| {
+                precursor.fragment_intensity[b]
+                    .partial_cmp(&precursor.fragment_intensity[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut tens: Vec<f32> = Vec::with_capacity((K + 3) * C);
+            for k in 0..K {
+                if k < order.len() {
+                    let row = normalized_xic.row(order[k]);
+                    for c in 0..C {
+                        let idx = alo + c as isize;
+                        tens.push(if idx >= 0 && (idx as usize) < nref {
+                            row[idx as usize]
+                        } else {
+                            0.0
+                        });
+                    }
+                } else {
+                    tens.extend(std::iter::repeat(0.0f32).take(C));
+                }
+            }
+            if let Some(ms1) = dia_data.ms1() {
+                let base_tol = self.params.mass_tolerance.max(30.0f32);
+                let step = if precursor.charge > 0 {
+                    C13_C12 / precursor.charge as f32
+                } else {
+                    C13_C12
+                };
+                for m in 0..3 {
+                    let xic = ms1
+                        .extract_xic(
+                            precursor.mz + m as f32 * step,
+                            cycle_start_idx,
+                            cycle_stop_idx,
+                            scan_start,
+                            scan_stop,
+                            base_tol,
+                        )
+                        .to_vec();
+                    let mx = xic.iter().cloned().fold(0.0f32, f32::max).max(1e-9);
+                    for c in 0..C {
+                        let idx = alo + c as isize;
+                        tens.push(if idx >= 0 && (idx as usize) < xic.len() {
+                            xic[idx as usize] / mx
+                        } else {
+                            0.0
+                        });
+                    }
+                }
+            } else {
+                tens.extend(std::iter::repeat(0.0f32).take(3 * C));
+            }
+            __feat.densexic_tensor = tens;
+        }
         Some(__feat)
     }
 }
